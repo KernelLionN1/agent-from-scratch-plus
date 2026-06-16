@@ -21,17 +21,22 @@ agent-from-scratch-plus/
 │   ├── llm_client.py      ← LLM 调用封装（DeepSeek / OpenAI 兼容）
 │   ├── tools.py           ← 工具注册中心 + 内置工具（计算器、文本查询）
 │   ├── agent.py           ← ReAct Agent 核心循环（集成记忆）
-│   └── memory.py          ← 对话记忆管理 + 上下文截断
+│   ├── memory.py          ← 对话记忆管理 + 上下文截断
+│   └── api.py             ← FastAPI 接口层（HTTP 服务）
 │
+├── main.py                ← 服务启动入口
 ├── test_phase1.py         ← 阶段一 验证脚本
 ├── test_phase2.py         ← 阶段二 验证脚本
 ├── test_phase3.py         ← 阶段三 验证脚本
+├── test_phase4.py         ← 阶段四 验证脚本
 │
 └── docs/
     ├── 计划/计划.md        ← 总学习计划（6天）
     ├── 执行/01-执行.md     ← Day1 执行日志（逐步更新）
     ├── 学习/01-学习.md     ← 阶段一 学习指南（概念+代码讲解）
-    └── 学习/02-学习.md     ← 阶段二 学习指南（ReAct循环详解）
+    ├── 学习/02-学习.md     ← 阶段二 学习指南（ReAct循环详解）
+    ├── 学习/03-学习.md     ← 阶段三 学习指南（记忆与截断）
+    └── 学习/04-学习.md     ← 阶段四 学习指南（FastAPI封装）
 ```
 
 ---
@@ -44,7 +49,7 @@ agent-from-scratch-plus/
 | 阶段一：LLM调用+工具 | ✅ 完成 | src/llm_client.py, src/tools.py |
 | 阶段二：ReAct循环 | ✅ 完成 | src/agent.py |
 | 阶段三：对话记忆 | ✅ 完成 | src/memory.py |
-| 阶段四：FastAPI封装 | ⬜ 待开始 | src/api.py, main.py |
+| 阶段四：FastAPI封装 | ✅ 完成 | src/api.py, main.py |
 
 ---
 
@@ -72,8 +77,12 @@ python test_phase2.py
 # 运行阶段三测试（对话记忆）
 python test_phase3.py
 
-# 阶段四测试（待创建）
-# python test_phase4.py
+# 运行阶段四测试（FastAPI 接口）
+python test_phase4.py
+
+# 启动完整的 HTTP 服务
+python main.py
+# 然后访问 http://localhost:8000/docs
 ```
 
 ---
