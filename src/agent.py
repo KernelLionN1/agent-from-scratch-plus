@@ -119,19 +119,15 @@ class ReActAgent:
             )
 
             # ── 步骤 3：处理 LLM 响应 ──
+            # 注意顺序：必须先检查 tool_calls 再检查 content！
+            # 原因：LLM 有时会返回 "好的我来做" + tool_calls 同时存在，
+            # 如果先检查 content 就直接 return 了，工具调用被跳过。
 
-            # 情况 A：LLM 直接给出文字回答
-            if response["content"]:
-                print(f"  [Agent] LLM 给出最终答案")
-                # 阶段三新增：把 LLM 回答也存入记忆
-                self.memory.add_assistant(content=response["content"])
-                return response["content"]
-
-            # 情况 B：LLM 请求调用工具
+            # 情况 A：LLM 请求调用工具（优先检查）
             if response["tool_calls"]:
-                # ── 阶段三新增：把 LLM 的工具调用意图存入记忆 ──
+                # ── 把 LLM 的工具调用意图存入记忆 ──
                 self.memory.add_assistant(
-                    content=None,
+                    content=response["content"],   # 可能有文字也可能为 None
                     tool_calls=[
                         {
                             "id": tc["id"],
@@ -145,24 +141,33 @@ class ReActAgent:
                     ],
                 )
 
-                # ── 步骤 4：执行工具 + 结果反馈 ──
+                # ── 执行工具 + 结果反馈 ──
                 for tc in response["tool_calls"]:
                     tool_name = tc["name"]
-                    # 解析 JSON 参数 —— 坑点：无异常处理
                     tool_args = json.loads(tc["arguments"])
 
                     print(f"  [Agent] 🔧 调用工具: {tool_name}({tool_args})")
 
-                    # 执行工具
                     tool_result = execute_tool(tool_name, tool_args)
                     print(f"  [Agent] 📤 工具结果: {tool_result}")
 
-                    # 阶段三新增：工具结果存入记忆（而非本地 messages）
                     self.memory.add_tool_result(
                         tool_call_id=tc["id"],
                         tool_name=tool_name,
                         result=tool_result,
                     )
+                # ── 工具执行完，继续循环让 LLM 看结果 ──
+                continue
+
+            # 情况 B：LLM 直接给出文字回答（没有 tool_calls）
+            if response["content"]:
+                print(f"  [Agent] LLM 给出最终答案")
+                self.memory.add_assistant(content=response["content"])
+                return response["content"]
+
+            # 情况 C：既没 tool_calls 也没 content（极端情况，添加保护）
+            print(f"  [Agent] ⚠️ LLM 返回空响应，重试...")
+            continue
 
     # ═══════════════════════════════════════════════════════
     # 记忆管理
