@@ -1,184 +1,232 @@
 """
-ReAct Agent 核心循环 —— 思考 → 行动 → 观察 的自动化
+ReAct Agent 核心循环 —— 集成对话记忆
 
-这是整个 Day1 最重要的文件。它把阶段一的两个独立模块
-（LLM 客户端 + 工具系统）串联成一个能自主行动的 Agent。
+阶段三升级：
+- 不再每次 run() 重新构建 messages
+- 使用 ConversationMemory 持久存储对话历史
+- 支持多轮对话（连续多次 run() 共享上下文）
+- 支持上下文截断策略
 
-刻意踩坑点：
+刻意踩坑点（阶段二保留 + 阶段三新增）：
 - 不设最大轮次限制 → 可能死循环
-- 无格式容错 → LLM 返回异常格式直接崩溃
-- 不校验工具参数 → 恶意/错误参数直接执行
+- 默认截断策略为 "none" → 长对话超出上下文窗口
+- token 估算粗糙 → 中文对话 token 数严重低估
 """
 
 import json
 
-# ── 导入阶段一的两个核心模块 ─────────────────────────────
-# 注意：这两个模块互相不认识，Agent 是它们的"调度者"
-from src.llm_client import LLMClient          # 负责和 LLM 对话
-from src.tools import get_tool_definitions, execute_tool  # 负责执行工具
+# ── 导入依赖模块 ─────────────────────────────────────────
+from src.llm_client import LLMClient
+from src.tools import get_tool_definitions, execute_tool
+from src.memory import ConversationMemory, TruncationStrategy
 
 
 class ReActAgent:
     """
-    ReAct（Reasoning + Acting）Agent 实现
+    带记忆的 ReAct Agent
 
-    核心思想：
-        1. 把用户问题发给 LLM
-        2. LLM 要么直接回答 → 结束
-        3. LLM 要么要求调工具 → 我们执行工具，结果反馈给 LLM
-        4. 重复 2-3，直到 LLM 给出最终答案
+    阶段二 → 阶段三的关键变化：
+    - 之前：每次 run() 从零构建 messages，对话完就忘
+    - 现在：所有消息存入 ConversationMemory，多次 run() 共享
 
     类比 Java：
-        这是一个有状态的服务类，持有 LLMClient 和工具定义。
-        相当于 @Service 注入了两个依赖。
+        @Service 类，注入 LLMClient 和 ConversationMemory 两个依赖。
+        ConversationMemory 相当于一个有状态 Repository，
+        持久化会话数据，支持不同的查询策略（截断方式）。
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        max_iterations: int = 10,                 # 阶段三新增：最大循环轮次
+        truncation_strategy: TruncationStrategy = "none",  # 阶段三新增：截断策略
+    ):
         """
-        初始化 Agent —— 准备 LLM 客户端和工具列表
+        初始化 Agent
 
-        工具定义只加载一次（注册表是全局的），
-        但 LLM 客户端可以换模型/Key（当前从 .env 读）
+        参数：
+            max_iterations:      防止死循环的轮次上限（默认 10）
+            truncation_strategy: 截断策略，可选 "none"|"sliding_window"|"token_limit"
         """
-        # 创建 LLM 客户端 —— 负责发 HTTP 请求
+        # ── 依赖组件 ──
         self.llm = LLMClient()
-
-        # 加载所有已注册的工具定义 —— 告诉 LLM "你能用这些"
         self.tools = get_tool_definitions()
 
+        # ── 记忆系统（阶段三新增）──
+        # ConversationMemory 存储所有对话，跨 run() 保留
+        self.memory = ConversationMemory(max_messages=20, max_tokens=4000)
+        self.truncation_strategy = truncation_strategy
+
         # ── 系统提示词 ──
-        # 告诉 LLM 它的角色和行为规则。相当于 Java 里的 @SystemPrompt
         self.system_prompt = (
             "你是一个有用的 AI 助手。"
             "当用户问需要计算或查询的问题时，请使用提供的工具。"
             "使用工具获取结果后，用自然语言向用户解释结果。"
         )
+        # 系统提示词存入 memory —— 它始终在消息列表第一位
+        self.memory.set_system(self.system_prompt)
+
+        # ── 循环控制 ──
+        self.max_iterations = max_iterations
+
+    # ═══════════════════════════════════════════════════════
+    # 核心入口
+    # ═══════════════════════════════════════════════════════
 
     def run(self, user_message: str) -> str:
         """
-        执行一次完整的 Agent 对话 —— 自动调用工具直到得出最终答案
+        执行一次 Agent 对话 —— 自动调用工具直到得出最终答案
 
         参数：
-            user_message: 用户输入的问题，如 "帮我计算 123*456"
+            user_message: 用户输入
 
         返回：
-            LLM 的最终回复文本
+            LLM 的最终回复
 
-        这是用户看到的唯一入口 —— 内部循环对用户透明。
+        阶段三变化：
+        - 不再每次构建 messages 列表，改为往 memory 里追加
+        - 每次调 LLM 前从 memory 获取（可能经过截断的）消息
+        - 支持多轮对话：第二次 run() 时 memory 里保留着之前的对话
         """
-
-        # ── 初始化消息列表 ──
-        # messages 就是整个对话的"上下文窗口"，LLM 能看到的历史
-        # system 消息在最前面，定义了 LLM 的行为规则
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_message},
-        ]
+        # ── 追加用户消息到记忆 ──
+        # 注意：这是持久化的，下次 run() 时还能看到
+        self.memory.add_user(user_message)
 
         # ── 记录循环轮次 ──
-        # 用于追踪 LLM 调了几次工具，帮助理解 Agent 的"思考深度"
         iteration = 0
 
         # ╔══════════════════════════════════════════════════╗
         # ║          ReAct 核心循环                          ║
-        # ║  Think → Act → Observe → Think → ...            ║
         # ╚══════════════════════════════════════════════════╝
-        #
-        # 注意：这里故意没有设最大轮次限制 ← 刻意踩坑！
-        # 如果 LLM 陷入循环（不断调工具但永远不给出答案），
-        # 这个 while True 会永远跑下去。
-        # 阶段三会加上 max_iterations 保护。
         while True:
             iteration += 1
             print(f"  [Agent] 第 {iteration} 轮思考...")
 
-            # ── 步骤 1：调用 LLM ──
-            # 把当前消息列表（含历史）发给 LLM，让它决定下一步
+            # ── 阶段三新增：轮次保护 ──
+            # 防止 LLM 陷入死循环（比如不断调工具但永远不回答）
+            if iteration > self.max_iterations:
+                print(f"  [Agent] ⚠️ 超过最大轮次 {self.max_iterations}，强制终止")
+                return "抱歉，处理超时，请尝试简化问题后重试。"
+
+            # ── 步骤 1：从记忆获取消息（可能截断）──
+            # 阶段三关键：不再用本地 messages 列表，而是从 memory 取
+            messages = self.memory.get_messages(strategy=self.truncation_strategy)
+
+            # ── 步骤 2：调用 LLM ──
             response = self.llm.chat(
                 messages=messages,
                 tools=self.tools,
-                temperature=0.1,  # 低温度 → 更确定性的输出，适合工具调用
+                temperature=0.1,
             )
 
-            # ── 步骤 2：检查 LLM 的回答方式 ──
-            # LLM 有两种回应：
-            #   A. 直接给出文字答案（content 不为空）→ 结束循环
-            #   B. 要求调用工具（tool_calls 不为空）→ 继续循环
+            # ── 步骤 3：处理 LLM 响应 ──
 
-            # 情况 A：LLM 直接回答了
+            # 情况 A：LLM 直接给出文字回答
             if response["content"]:
                 print(f"  [Agent] LLM 给出最终答案")
+                # 阶段三新增：把 LLM 回答也存入记忆
+                self.memory.add_assistant(content=response["content"])
                 return response["content"]
 
-            # 情况 B：LLM 想调用工具
+            # 情况 B：LLM 请求调用工具
             if response["tool_calls"]:
-                # ── 步骤 3：执行 LLM 请求的工具 ──
-                # 注意：LLM 可能一次请求多个工具调用
+                # ── 阶段三新增：把 LLM 的工具调用意图存入记忆 ──
+                self.memory.add_assistant(
+                    content=None,
+                    tool_calls=[
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": tc["arguments"],
+                            },
+                        }
+                        for tc in response["tool_calls"]
+                    ],
+                )
+
+                # ── 步骤 4：执行工具 + 结果反馈 ──
                 for tc in response["tool_calls"]:
                     tool_name = tc["name"]
-                    # arguments 是 JSON 字符串，需要解析
-                    # 坑点：不做异常处理，如果 LLM 传了非法 JSON 直接崩溃
+                    # 解析 JSON 参数 —— 坑点：无异常处理
                     tool_args = json.loads(tc["arguments"])
 
                     print(f"  [Agent] 🔧 调用工具: {tool_name}({tool_args})")
 
-                    # 真正执行工具 —— 这里才从"LLM 的想法"变成"实际动作"
+                    # 执行工具
                     tool_result = execute_tool(tool_name, tool_args)
                     print(f"  [Agent] 📤 工具结果: {tool_result}")
 
-                    # ── 步骤 4：把工具结果反馈给 LLM ──
-                    # 这是 ReAct 循环的关键：把工具结果作为一条新消息
-                    # 追加到对话历史，下一轮 LLM 就能"看到"这个结果
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": tc["arguments"],
-                                },
-                            }
-                        ],
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "content": tool_result,
-                        "tool_call_id": tc["id"],
-                    })
+                    # 阶段三新增：工具结果存入记忆（而非本地 messages）
+                    self.memory.add_tool_result(
+                        tool_call_id=tc["id"],
+                        tool_name=tool_name,
+                        result=tool_result,
+                    )
 
-            # ── 循环继续 ──
-            # messages 里已经多了 assistant（带 tool_calls）+ tool（结果）
-            # 下一轮 LLM 会"看到"调用历史和结果，基于此决定下一步
+    # ═══════════════════════════════════════════════════════
+    # 记忆管理
+    # ═══════════════════════════════════════════════════════
+
+    def clear_memory(self):
+        """
+        清空对话记忆 —— 开始全新对话
+
+        会保留 system prompt，只清除 user/assistant/tool 消息。
+        """
+        self.memory.clear()
+        self.memory.set_system(self.system_prompt)
+        print("[Agent] 记忆已清空")
+
+    def set_truncation(self, strategy: TruncationStrategy):
+        """
+        切换截断策略 —— 用于对比测试不同策略的效果
+
+        用法：
+            agent.set_truncation("sliding_window")
+            agent.run("继续上一轮的问题...")
+        """
+        self.truncation_strategy = strategy
+        print(f"[Agent] 截断策略切换为: {strategy}")
+
+    def memory_stats(self) -> dict:
+        """
+        返回记忆状态信息 —— 调试和监控用
+
+        返回：
+            {"total_messages": N, "non_system": N, "strategy": "..."}
+        """
+        return {
+            "total_messages": len(self.memory),
+            "non_system": self.memory.count_messages(),
+            "strategy": self.truncation_strategy,
+        }
 
 
-# ── 便捷函数：快速运行 Agent ──────────────────────────────
+# ── 便捷函数 ─────────────────────────────────────────────
 def run_agent(question: str) -> str:
-    """
-    一键启动 Agent，输入问题返回答案
-
-    用法：
-        >>> answer = run_agent("123 * 456 等于多少？")
-    """
+    """一键启动带记忆的 Agent"""
     agent = ReActAgent()
     return agent.run(question)
 
 
-# ── 模块自测（直接运行 python src/agent.py 时触发） ─────
+# ── 模块自测 ─────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 50)
-    print("ReAct Agent 自测")
+    print("ReAct Agent（带记忆）自测")
     print("=" * 50)
 
-    questions = [
-        "帮我计算 (100 + 200) * 3 等于多少",
-        "请介绍一下 Python 是什么",
+    agent = ReActAgent(max_iterations=10, truncation_strategy="none")
+
+    # 测试多轮对话
+    rounds = [
+        "帮我计算 100 + 200 等于多少",
+        "刚才的结果再乘以 3 等于多少",   # ← 需要记住上一轮
     ]
 
-    for q in questions:
+    for q in rounds:
         print(f"\n👤 用户: {q}")
-        answer = run_agent(q)
+        answer = agent.run(q)
         print(f"🤖 Agent: {answer}")
+        print(f"📊 {agent.memory_stats()}")
         print("-" * 50)

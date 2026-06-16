@@ -20,10 +20,12 @@ agent-from-scratch-plus/
 │   ├── __init__.py
 │   ├── llm_client.py      ← LLM 调用封装（DeepSeek / OpenAI 兼容）
 │   ├── tools.py           ← 工具注册中心 + 内置工具（计算器、文本查询）
-│   └── agent.py           ← ReAct Agent 核心循环（Think→Act→Observe）
+│   ├── agent.py           ← ReAct Agent 核心循环（集成记忆）
+│   └── memory.py          ← 对话记忆管理 + 上下文截断
 │
 ├── test_phase1.py         ← 阶段一 验证脚本
 ├── test_phase2.py         ← 阶段二 验证脚本
+├── test_phase3.py         ← 阶段三 验证脚本
 │
 └── docs/
     ├── 计划/计划.md        ← 总学习计划（6天）
@@ -41,7 +43,7 @@ agent-from-scratch-plus/
 | 环境验证 | ✅ 完成 | .venv, .env, .gitignore |
 | 阶段一：LLM调用+工具 | ✅ 完成 | src/llm_client.py, src/tools.py |
 | 阶段二：ReAct循环 | ✅ 完成 | src/agent.py |
-| 阶段三：对话记忆 | ⬜ 待开始 | src/memory.py |
+| 阶段三：对话记忆 | ✅ 完成 | src/memory.py |
 | 阶段四：FastAPI封装 | ⬜ 待开始 | src/api.py, main.py |
 
 ---
@@ -67,8 +69,11 @@ python test_phase1.py
 # 运行阶段二测试（ReAct Agent）
 python test_phase2.py
 
-# 阶段三测试（待创建）
-# python test_phase3.py
+# 运行阶段三测试（对话记忆）
+python test_phase3.py
+
+# 阶段四测试（待创建）
+# python test_phase4.py
 ```
 
 ---
