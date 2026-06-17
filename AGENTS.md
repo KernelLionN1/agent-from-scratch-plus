@@ -1,7 +1,7 @@
 # Agent From Scratch Plus
 
 > 从零手搓 AI Agent 的学习工程  
-> 当前分支：`02-multi-agent-handcode` | Day2 原生多Agent ✅ 完成
+> 当前分支：`06-final-review` | Day6 验收 + 面试复盘
 
 ## 项目概述
 
