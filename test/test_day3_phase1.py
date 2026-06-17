@@ -1,23 +1,14 @@
 """
 Day3 阶段一验证脚本 —— Day1 遗留 9 坑修复验证
 
-验证内容：
-1. eval 安全修复（白名单 + 受限命名空间）
-2. search_knowledge 返回格式化文本
-3. system prompt 强化（"必须"而非"请"）
-4. max_iterations 轮次上限生效
-5. 工具执行异常保护
-6. 上下文截断策略可用
-7. token 估算区分中英文
-8. 不再使用全局 agent（工厂函数隔离）
-9. API 端点 async + 超时保护
-
 运行方式：
     source .venv/bin/activate
-    python test_day3_phase1.py
+    python test/test_day3_phase1.py
 """
 
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import inspect
 
 # ── 导入验证目标 ──────────────────────────────────────────

@@ -1,17 +1,15 @@
 """
 Day3 阶段三验证脚本 —— Agent 行为修复
 
-验证内容：
-1. 角色 Prompt 收紧（Planner/Coder/Reviewer）
-2. 输出格式约束（代码块提取/结构化审核）
-3. 消息总线修复（增量消费/去重/依赖检查）
-
 运行方式：
     source .venv/bin/activate
-    PYTHONPATH=. python test/test_day3_phase3.py
+    python test/test_day3_phase3.py
 """
 
 import sys
+import os
+# 自动将项目根目录加入 Python 路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import inspect
 import asyncio
 import threading

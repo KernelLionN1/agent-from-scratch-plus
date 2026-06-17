@@ -13,6 +13,8 @@ Day3 阶段二验证脚本 —— 失败重试 + 熔断机制
 """
 
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import inspect
 import asyncio
 
