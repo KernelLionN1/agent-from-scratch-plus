@@ -134,17 +134,23 @@ def test_message_duplication_bug():
     first_read = bus.receive("coder")
     assert len(first_read) == 1, f"第一次读取应该有 1 条消息"
 
-    # 第二次读取 —— 【踩坑】应该还是 1 条（未被消费）
+    # 第二次读取 —— Day3 已修复：偏移量前进，不再重复返回
     second_read = bus.receive("coder")
-    assert len(second_read) == 1, f"第二次读取应该有 1 条消息（重复消费）"
+    assert len(second_read) == 0, f"Day3修复后第二次应返回0条（已消费），实际{len(second_read)}条"
 
-    # 验证是同一消息（ID 相同）
-    assert first_read[0].id == second_read[0].id, "两条消息 ID 不同？不应该"
+    # 验证 receive_all 仍可获取全部（不更新偏移）
+    all_msgs = bus.receive_all("coder")
+    assert len(all_msgs) == 1, "receive_all 应返回全部消息"
+
+    # 验证 receive_all 仍可获取全部（不更新偏移）
+    all_msgs = bus.receive_all("coder")
+    assert len(all_msgs) == 1, "receive_all 应返回全部消息"
+    assert all_msgs[0].id == first_read[0].id, "ID 应相同"
 
     print(f"  第一次 receive: {len(first_read)} 条 → ID={first_read[0].id}")
-    print(f"  第二次 receive: {len(second_read)} 条 → ID={second_read[0].id}")
-    print(f"  ⚠️ 【已验证踩坑】消息未被消费，同一消息被多次读取")
-    print(f"  ✅ 踩坑验证通过\n")
+    print(f"  第二次 receive: {len(second_read)} 条（Day3 修复后不再重复）")
+    print(f"  receive_all: {len(all_msgs)} 条（不更新偏移）")
+    print(f"  ✅ Day3 修复验证通过：消息不再重复消费\n")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -170,9 +176,12 @@ def test_advanced_features():
         content="全员通知：项目启动",
         receivers=["coder", "reviewer"],
     )
-    assert len(bus.receive("coder")) == 1
-    assert len(bus.receive("reviewer")) == 1
-    print(f"  ✅ 广播成功：Coder={len(bus.receive('coder'))}条, Reviewer={len(bus.receive('reviewer'))}条")
+    # Day3 修复后 receive() 会更新偏移，用 receive_all 做验证（不更新偏移）
+    coder_all = bus.receive_all("coder")
+    reviewer_all = bus.receive_all("reviewer")
+    assert len(coder_all) == 1, f"广播后 coder 应有1条: {len(coder_all)}"
+    assert len(reviewer_all) == 1, f"广播后 reviewer 应有1条: {len(reviewer_all)}"
+    print(f"  ✅ 广播成功：Coder={len(coder_all)}条, Reviewer={len(reviewer_all)}条")
 
     # ── 按类型过滤 ──
     bus.send(Message(sender="planner", receiver="coder", type="task", content="写代码"))

@@ -145,15 +145,10 @@ class MessageBus:
         """
         向多个接收方广播同一条消息
 
-        参数：
-            sender:    发送方标识
-            type_:     消息类型
-            content:   消息内容
-            receivers: 接收方标识列表
+        内部实现：对每个 receiver 创建独立的 Message 实例并直接写入队列。
+        绕过 send() 的去重检查——广播的本质就是对不同接收方发"同一内容"。
 
-        内部实现：对每个 receiver 创建独立的 Message 实例并 send()
-
-        用途：Planner 把任务分发给多个 Coder 时用
+        Day6 修复：之前调用 send()，去重导致除了第一个接收方外全被丢弃。
         """
         for receiver in receivers:
             msg = Message(
@@ -162,7 +157,11 @@ class MessageBus:
                 type=type_,
                 content=content,
             )
-            self.send(msg)
+            # 直接入队，不走 send() 的去重逻辑
+            if receiver not in self._queues:
+                self._queues[receiver] = []
+            self._queues[receiver].append(msg)
+            self._message_count += 1
 
     # ═══════════════════════════════════════════════════════
     # 接收
