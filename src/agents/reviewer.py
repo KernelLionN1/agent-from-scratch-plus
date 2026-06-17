@@ -58,18 +58,14 @@ class ReviewerAgent(BaseAgent):
 
         【踩坑】审核意见格式不固定，下游解析困难
         """
+        # Day3 修复 #16：对齐系统 prompt 的 4 维度结构化格式
         return self.call_llm(
             user_prompt=(
-                f"请审查以下 Python 代码，指出问题和改进建议：\n\n"
+                f"请审查以下 Python 代码，按 4 维度输出结构化审核报告：\n\n"
                 f"```python\n{code}\n```\n\n"
-                f"请从以下维度审查：\n"
-                f"1. 正确性：代码是否能正确运行？\n"
-                f"2. 可读性：命名是否清晰？注释是否充分？\n"
-                f"3. 性能：是否有明显的性能问题？\n"
-                f"4. 安全性：是否存在安全风险？\n\n"
-                f"请给出具体的修改建议。"
-                # 【踩坑】没有要求输出结构化格式（如 JSON）
-                # 导致 Coder 解析审核意见时可能出错
+                f"要求：每个维度用 ✅/⚠️/❌ 标记结论，\n"
+                f"改进建议必须具体可执行，\n"
+                f"如有修改必要请提供改进后的完整代码。"
             )
         )
 
@@ -85,18 +81,14 @@ class ReviewerAgent(BaseAgent):
 
         这是阶段二串行流程的第三步（审核环节）。
         """
-        # 从消息总线获取代码
-        code_msgs = [
-            m for m in self.bus.receive(self.name)
-            if m.type == "code"
-        ]
-
-        if not code_msgs:
-            print(f"  [Reviewer] ⚠️ 没有待审核的代码")
+        # Day3 修复 #20：用 wait_for_message 确保 Coder 已完成再审核
+        # 从消息总线获取代码（带超时等待）
+        code_msg = self.bus.wait_for_message(self.name, "code", timeout=30.0)
+        if not code_msg:
+            print(f"  [Reviewer] ⚠️ 超时：未收到 Coder 的代码消息")
             return ""
 
-        # 取最新的代码消息
-        latest_code = code_msgs[-1].content
+        latest_code = code_msg.content
         print(f"  [Reviewer] 📥 收到代码，{len(latest_code)} 字符")
 
         # 审核

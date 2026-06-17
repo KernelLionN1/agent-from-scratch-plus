@@ -60,18 +60,13 @@ class PlannerAgent(BaseAgent):
 
         【踩坑】不限定拆分粒度和输出格式
         """
-        # ── 构建 prompt ──
-        # 用 Planner 角色的 system prompt + 用户需求
+        # ── 构建 prompt（Day3 修复 #14：对齐系统 prompt 的 ### 子任务 N 格式）──
         return self.call_llm(
             user_prompt=(
-                f"请分析以下用户需求，并将其拆分为可执行的子任务：\n\n"
+                f"请分析以下用户需求，拆分为 3-8 个独立子任务：\n\n"
                 f"用户需求：{requirement}\n\n"
-                f"请列出每个子任务的：\n"
-                f"1. 任务名称\n"
-                f"2. 任务描述\n"
-                f"3. 预期输入/输出\n"
-                # 【踩坑】没有要求具体的格式（JSON/YAML/编号），
-                # 也没有限制子任务数量
+                f"每个子任务包含：任务标题、详细描述（输入/输出/约束）\n"
+                f"严格按照 ### 子任务 1：标题 的格式输出。"
             )
         )
 

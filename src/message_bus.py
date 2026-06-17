@@ -97,44 +97,49 @@ class MessageBus:
         """
         初始化空的消息总线
 
-        _queues 的结构：
-            {
-                "planner": [msg1, msg2, ...],
-                "coder":   [msg3, ...],
-                "reviewer": [msg4, ...],
-            }
+        Day3 修复 #18+#19：增加去重和增量消费支持
+        - _offsets: 每个接收方的已读消息偏移
+        - _seen_hashes: 已发送消息的去重指纹
         """
-        # dict 的 key 是接收方标识，value 是消息列表
-        # 初始为空，第一个 send() 调用时自动创建对应 key
         self._queues: dict[str, list[Message]] = {}
-        # 全局消息计数 —— 用于统计
         self._message_count: int = 0
+        # Day3 修复 #18：每个接收方的已读偏移（增量消费）
+        self._offsets: dict[str, int] = {}
+        # Day3 修复 #19：消息去重指纹集合（sender+type+content）
+        self._seen_hashes: set[str] = set()
 
     # ═══════════════════════════════════════════════════════
     # 发送
     # ═══════════════════════════════════════════════════════
 
-    def send(self, message: Message) -> None:
+    def send(self, message: Message) -> str | None:
         """
-        发送一条消息到指定接收方的队列
+        发送消息（Day3 修复 #19：自动去重）
 
         参数：
             message: Message 实例
 
-        行为：
-            - 消息追加到 receiver 对应的队列末尾
-            - 如果 receiver 队列不存在，自动创建
-            - 【踩坑】不做任何去重检查或消息大小限制
+        返回：
+            消息 ID（如果是新消息），None（如果是重复消息）
+
+        去重逻辑：同一 sender+type+content 的消息只发一次。
         """
         receiver = message.receiver
-
-        # 如果该接收方还没有队列，创建一个
         if receiver not in self._queues:
             self._queues[receiver] = []
 
-        # 追加到队尾 —— FIFO 语义
+        # ── Day3 修复 #19：消息去重 ──
+        # 计算消息指纹：sender + type + content（前 200 字）
+        content_hash = message.content[:200] if message.content else ""
+        fingerprint = f"{message.sender}|{message.type}|{content_hash}"
+        if fingerprint in self._seen_hashes:
+            # 重复消息，静默忽略
+            return None
+        self._seen_hashes.add(fingerprint)
+
         self._queues[receiver].append(message)
         self._message_count += 1
+        return message.id
 
     def broadcast(self, sender: str, type_: str, content: str, receivers: list[str]) -> None:
         """
@@ -165,26 +170,56 @@ class MessageBus:
 
     def receive(self, receiver: str) -> list[Message]:
         """
-        获取指定接收方的所有消息
+        Day3 修复 #18：增量拉取 —— 只返回未读过的新消息
+
+        每次调用后自动推进读取偏移，不会重复返回同一条消息。
 
         参数：
-            receiver: 接收方标识（如 "coder"）
+            receiver: 接收方标识
 
         返回：
-            该接收方的消息列表（按到达时间排序）
-
-        【踩坑】只读不删——关键踩坑点：
-            - 消息不会被消费，下次 receive() 还能拿到
-            - 同一个 receiver 调用 N 次 receive()，每次都拿到全量历史消息
-            - 多个 Agent 都能读到发给同一个 receiver 的消息
-            - 这会导致重复处理、无限循环
-            - Day3 修复：增加 consume() 方法标记已读，或 receive() 直接 pop
-
-        类比 Java：
-            相当于只调用了 Queue.peek() 而不调 poll()，
-            消息永远留在队列里。
+            新到达的（未被该接收方读过）消息列表
         """
-        return self._queues.get(receiver, [])
+        messages = self._queues.get(receiver, [])
+        offset = self._offsets.get(receiver, 0)
+
+        # 从上次读取位置开始拿新消息
+        new_msgs = messages[offset:]
+        # 更新偏移到队尾
+        self._offsets[receiver] = len(messages)
+        return new_msgs
+
+    def receive_all(self, receiver: str) -> list[Message]:
+        """
+        获取所有消息（不更新偏移，用于调试和首次全量拉取）
+        """
+        return list(self._queues.get(receiver, []))
+
+    def wait_for_message(
+        self, receiver: str, msg_type: str, timeout: float = 30.0
+    ) -> Message | None:
+        """
+        Day3 修复 #20：阻塞等待指定类型的消息到达（依赖检查）
+
+        用于确保执行顺序 —— 例如 Reviewer 等 Coder 的 code 消息到达后再审核。
+
+        参数：
+            receiver: 等待的接收方
+            msg_type: 等待的消息类型
+            timeout:  最大等待秒数
+
+        返回：
+            匹配的 Message（成功），None（超时）
+        """
+        import time as _time
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            # 用 receive_all 检查（不用 receive，避免推进 offset）
+            for msg in self._queues.get(receiver, []):
+                if msg.type == msg_type:
+                    return msg
+            _time.sleep(0.1)
+        return None  # 超时
 
     def receive_since(self, receiver: str, since: float) -> list[Message]:
         """

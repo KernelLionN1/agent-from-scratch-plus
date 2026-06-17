@@ -58,18 +58,19 @@ class CoderAgent(BaseAgent):
 
         【踩坑】不做输入校验，不限定输出格式
         """
-        return self.call_llm(
+        # Day3 修复 #15：要求纯代码块输出
+        raw = self.call_llm(
             user_prompt=(
-                f"请根据以下任务描述编写 Python 代码：\n\n"
-                f"任务描述：\n{task_description}\n\n"
+                f"请根据以下技术规格编写 Python 代码：\n\n"
+                f"技术规格：\n{task_description}\n\n"
                 f"要求：\n"
-                f"- 代码包含详细的中文注释\n"
-                f"- 包含函数定义和简单的测试代码（if __name__ == '__main__'）\n"
-                f"- 代码可以直接运行\n"
-                # 【踩坑】没有要求代码必须通过语法检查
-                # 【踩坑】没有要求返回格式（纯代码 / 带解释 / JSON）
+                f"- 只输出代码块（```python ... ```），不要写分析\n"
+                f"- 代码包含中文注释和 docstring\n"
+                f"- 包含 if __name__ == '__main__' 测试\n"
             )
         )
+        # Day3 修复 #21：提取代码块中的纯代码
+        return _extract_code_block(raw)
 
     def code_and_submit(self, task_description: str, reviewer_name: str = "reviewer-1") -> str:
         """
@@ -102,7 +103,7 @@ class CoderAgent(BaseAgent):
         返回：
             修复后的代码
         """
-        return self.call_llm(
+        raw = self.call_llm(
             user_prompt=(
                 f"请根据以下审核意见修改代码：\n\n"
                 f"审核意见：\n{review_feedback}\n\n"
@@ -110,6 +111,29 @@ class CoderAgent(BaseAgent):
                 f"包含中文注释说明修改了哪些问题。"
             )
         )
+        # Day3 修复 #21：修复后的代码也提取纯代码块
+        return _extract_code_block(raw)
+
+
+# ── Day3 修复 #21：代码块提取函数 ─────────────────────────
+def _extract_code_block(text: str) -> str:
+    """
+    从 LLM 输出中提取纯代码
+
+    处理三种情况：
+    1. ```python\\n<code>\\n``` → 提取 <code>
+    2. ```\\n<code>\\n```（无语言标签） → 提取 <code>
+    3. 没有代码块标记 → 返回原始文本
+
+    Java 类比：正则 Pattern.compile("```...").matcher(text)
+    """
+    import re
+    # 匹配 ```python 或 ``` 开头的代码块
+    match = re.search(r'```(?:python)?\s*\n(.*?)```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # 没有代码块标记，返回原文
+    return text.strip()
 
 
 # ── 模块自测 ──────────────────────────────────────────────
