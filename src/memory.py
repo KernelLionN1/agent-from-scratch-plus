@@ -59,6 +59,11 @@ class ConversationMemory:
         # ── Day5: 上下文窗口大小（用于自动压缩阈值判断）──
         self.context_window: int = 65536  # DeepSeek 默认 64K tokens
 
+        # ── Day6: 增量压缩锚点（Factory.ai 方案）──
+        self._anchor_summary: str = ""     # 已压缩的历史摘要
+        self._anchor_msg_count: int = 0    # 压缩到了第几条消息
+        self._light_anchor: int = 0         # 轻量压缩锚点（每次+10%触发，只处理增量）
+
         # ── 内部状态 ──
         self._system_content: str = ""  # 系统提示词单独保存
 
@@ -185,52 +190,50 @@ class ConversationMemory:
 
     def compress_light(self, messages: list[dict] = None) -> list[dict]:
         """
-        轻量压缩：纯字符串操作，<100ms，不调 LLM
+        轻量压缩（Day6 升级：增量锚点）
 
-        触发阈值：上下文窗口 10%（默认 6553 tokens）
+        纯字符串操作，<100ms，不调 LLM。
+        每次只处理上次压缩之后新增的消息，避免重复工作。
+
+        触发逻辑：auto_compress 在 10%、20%、30%... 每次调用都只处理增量。
 
         策略：
-        1. 剔除失败的工具调用 → 只保留成功结果
-        2. 口语化改写 → "那个啥，帮我算一下" → "计算: 帮我算一下"
-        3. 合并连续同类消息 → 减少消息条数
-
-        Java 类比：StringBuilder 级别的优化，不涉及网络 IO
+        1. 剔除失败的工具调用
+        2. 口语化改写
+        3. 合并连续同类消息
         """
         msgs = messages if messages is not None else self.get_messages("none")
         if not msgs:
             return msgs
 
-        before_count = len(msgs)
-        before_tokens = self._count_tokens(msgs)
+        # ── 增量：只处理锚点之后的新消息 ──
+        already_done = msgs[:self._light_anchor]   # 之前已压缩过的
+        new_msgs = msgs[self._light_anchor:]        # 本次要处理的新消息
+
+        if not new_msgs:
+            return msgs  # 没有新消息，直接返回
+
+        before_tokens = self._count_tokens(new_msgs)
         import time
         start = time.perf_counter()
 
         # ── 步骤1: 剔除失败的工具调用 ──
-        # 失败特征：content 包含 "失败"、"Error"、"TypeError" 等
         TOOL_FAILURE_KEYWORDS = [
             "工具执行失败", "Error", "TypeError", "ValueError",
             "KeyError", "AttributeError", "got an unexpected keyword"
         ]
         filtered = []
-        for msg in msgs:
+        for msg in new_msgs:
             if msg.get("role") == "tool":
                 content = str(msg.get("content", ""))
                 if any(kw in content for kw in TOOL_FAILURE_KEYWORDS):
-                    continue  # 跳过失败的工具结果
+                    continue
             filtered.append(msg)
 
         # ── 步骤2: 口语化改写 ──
-        # 只处理 user 角色，去掉口语冗余前缀
-        # "那个啥，帮我算一下 100+200" → "计算: 100+200"
-        # "嗯...我想问一下..." → ""
         COLLOQUIAL_PATTERNS = [
-            ("那个啥，", ""),
-            ("嗯...", ""),
-            ("我想问一下", ""),
-            ("帮我", ""),
-            ("能不能", ""),
-            ("请问", ""),
-            ("麻烦你", ""),
+            ("那个啥，", ""), ("嗯...", ""), ("我想问一下", ""),
+            ("帮我", ""), ("能不能", ""), ("请问", ""), ("麻烦你", ""),
         ]
         rewritten = []
         for msg in filtered:
@@ -241,19 +244,16 @@ class ConversationMemory:
                         if content.startswith(pattern):
                             content = content[len(pattern):].strip()
                             break
-                    # 如果去掉前缀后还有内容
                     if content and content[-1] not in "？！。.?!，,：:":
                         content += "。"
                 msg = {**msg, "content": content}
             rewritten.append(msg)
 
         # ── 步骤3: 合并连续同类消息 ──
-        # 连续 tool 结果合并为一条
         merged = []
         for msg in rewritten:
             if (merged and msg.get("role") == "tool"
                     and merged[-1].get("role") == "tool"):
-                # 合并到上一条 tool
                 merged[-1] = {
                     **merged[-1],
                     "content": merged[-1]["content"] + " | " + msg.get("content", ""),
@@ -261,35 +261,38 @@ class ConversationMemory:
             else:
                 merged.append(msg)
 
+        # ── 拼回：已处理前缀 + 新处理后缀 ──
+        result = already_done + merged
+        self._light_anchor = len(result)  # 更新锚点
+
         elapsed_ms = (time.perf_counter() - start) * 1000
-        after_tokens = self._count_tokens(merged)
-        saved_tokens = before_tokens - after_tokens
+        after_tokens = self._count_tokens(result)
+        saved = before_tokens - self._count_tokens(merged)
 
-        print(f"  ⚡ 轻量压缩: {before_count}条→{len(merged)}条, "
-              f"{before_tokens}→{after_tokens}tokens (节省{saved_tokens}), "
-              f"{elapsed_ms:.1f}ms")
+        print(f"  ⚡ 轻量压缩(增量): +{len(new_msgs)}条新消息→处理后{len(merged)}条, "
+              f"总{len(result)}条, {before_tokens}→{after_tokens}t, {elapsed_ms:.1f}ms")
 
-        return merged
-
+        return result
     def compress_heavy(self, messages: list[dict] = None, llm=None) -> list[dict]:
         """
-        重量压缩：调用 LLM 重写，>500ms，但压缩率极高
+        重量压缩（Day6 升级：增量锚点，借鉴 Factory.ai）
 
-        触发阈值：上下文窗口 70%（默认 ~35000 tokens）
+        与 Day5 版本的关键区别：
+        - Day5: 每次全量重压缩全部消息 → O(n) 重复计算
+        - Day6: 只压缩上次压缩之后新增的消息 → 合并到已有摘要
 
-        策略：
-        1. 剔除失败的工具调用和最早轮次
-        2. 提取"目标 + 关键结果"，丢弃中间过程
-        3. 调用 LLM 进行总结重写 → 规范化输出
+        流程：
+        1. 轻量清理
+        2. 只取 _anchor_msg_count 之后的新消息
+        3. 调 LLM 合并新消息到已有摘要
+        4. 更新锚点
 
         Args:
             messages: 要压缩的消息列表（默认取全部）
-            llm: LLMClient 实例（必须提供）
+            llm: LLMClient 实例
 
         Returns:
-            list[dict]: 压缩后的消息（system + 压缩内容作为单条 user-like 消息）
-
-        Java 类比：调用外部 NLP 服务做文本摘要
+            list[dict]: system + 压缩摘要
         """
         if llm is None:
             raise ValueError("compress_heavy() 需要 LLMClient 实例")
@@ -301,28 +304,41 @@ class ConversationMemory:
         before_count = len(msgs)
         before_tokens = self._count_tokens(msgs)
 
-        # ── 步骤1: 先做轻量清理 ──
+        # ── 步骤1: 轻量清理 ──
         msgs = self.compress_light(msgs)
 
-        # ── 步骤2: 提取目标和关键结果 ──
-        # 保留 system + 第一条 user（目标）+ 最后一条 assistant（结果）
+        # ── 步骤2: 增量——只取锚点之后的新消息 ──
+        new_msgs = msgs[self._anchor_msg_count:]
+        if not new_msgs:
+            # 没有新消息，直接返回已有摘要
+            return self._build_compressed_result([m for m in msgs if m.get("role") == "system"])
+
         system_msgs = [m for m in msgs if m.get("role") == "system"]
-        user_msgs = [m for m in msgs if m.get("role") == "user"]
-        assistant_msgs = [m for m in msgs if m.get("role") == "assistant" and not m.get("tool_calls")]
 
-        # 构建压缩提示词
-        goals = "\n".join([m.get("content", "")[:200] for m in user_msgs[:5]])
-        results = "\n".join([m.get("content", "")[:300] for m in assistant_msgs[-3:]])
+        # ── 步骤3: 构建增量压缩提示词 ──
+        new_user = [m.get("content", "")[:200] for m in new_msgs if m.get("role") == "user"]
+        new_assistant = [m.get("content", "")[:200] for m in new_msgs if m.get("role") == "assistant" and not m.get("tool_calls")]
+        new_text = "\n".join(new_user + new_assistant)[:1500]
 
-        compress_prompt = (
-            "你是一个对话压缩器。请将以下多轮对话压缩为一段简洁的摘要，"
-            "只保留用户的核心目标和最终结果，去掉中间过程、闲聊和失败尝试。\n\n"
-            f"## 用户目标\n{goals}\n\n"
-            f"## 得出结果\n{results}\n\n"
-            "请用中文输出压缩后的摘要（200字以内）："
-        )
+        if self._anchor_summary:
+            # 增量模式：合并已有摘要 + 新内容
+            compress_prompt = (
+                "你是一个对话压缩器。以下是之前对话的摘要和新的对话内容。\n"
+                "请将新内容合并到已有摘要中，保持简洁（200字以内）。\n\n"
+                f"[已有摘要]\n{self._anchor_summary}\n\n"
+                f"[新增内容]\n{new_text}\n\n"
+                "请输出合并后的完整摘要："
+            )
+        else:
+            # 首次压缩：全量
+            compress_prompt = (
+                "你是一个对话压缩器。请将以下对话压缩为一段简洁的摘要，"
+                "只保留用户的核心目标、关键决策和最终结果。\n\n"
+                f"{new_text}\n\n"
+                "请用中文输出（200字以内）："
+            )
 
-        # ── 步骤3: 调 LLM 做压缩 ──
+        # ── 步骤4: 调 LLM ──
         import time
         start = time.perf_counter()
 
@@ -334,27 +350,39 @@ class ConversationMemory:
             )
             summary = compressed.get("content", "").strip()
         except Exception as e:
-            # LLM 调用失败 → 回退到轻量压缩结果
             print(f"  ⚠️  重量压缩 LLM 调用失败: {e}，回退到轻量压缩")
             return msgs
 
         elapsed_ms = (time.perf_counter() - start) * 1000
 
-        # ── 步骤4: 构建压缩后的消息 ──
-        result = list(system_msgs)  # 保留 system prompt
-        result.append({
-            "role": "user",
-            "content": f"[对话摘要] {summary}",
-        })
+        # ── 步骤5: 更新锚点 ──
+        self._anchor_summary = summary
+        self._anchor_msg_count = len(msgs)
 
+        result = self._build_compressed_result(system_msgs, summary)
         after_tokens = self._count_tokens(result)
         saved_tokens = before_tokens - after_tokens
 
-        print(f"  🔥 重量压缩: {before_count}条→{len(result)}条, "
+        mode = "增量" if before_count > len(new_msgs) else "全量"
+        print(f"  🔥 重量压缩({mode}): {before_count}条→{len(result)}条, "
               f"{before_tokens}→{after_tokens}tokens (节省{saved_tokens}), "
               f"{elapsed_ms:.0f}ms")
 
         return result
+
+    def _build_compressed_result(self, system_msgs: list, summary: str = None) -> list[dict]:
+        """构建压缩后的消息列表"""
+        result = list(system_msgs)
+        text = summary or self._anchor_summary
+        if text:
+            result.append({"role": "user", "content": f"[对话摘要] {text}"})
+        return result
+
+    def reset_anchor(self):
+        """重置锚点（新建对话时调用）"""
+        self._anchor_summary = ""
+        self._anchor_msg_count = 0
+        self._light_anchor = 0
 
     def auto_compress(self, llm=None) -> list[dict] | None:
         """
@@ -562,7 +590,109 @@ class SQLiteChatMessageHistory:
             return row["cnt"] if row else 0
 
 
-def _extract_message_fields(msg) -> tuple[str, str, list | None, str | None]:
+# ═══════════════════════════════════════════════════════════
+# Day6: MEMORY.md 文件持久化（跨会话记忆）
+# ═══════════════════════════════════════════════════════════
+
+class FileMemoryStore:
+    """
+    Day6 新增：基于文件的跨会话记忆
+
+    对标 Hermes Agent 的 MEMORY.md / USER.md 机制。
+    把用户偏好、关键决策等信息持久化到磁盘，
+    即使切换会话也能携带这些记忆。
+
+    存储格式：
+        # 用户偏好
+        用户喜欢简短回答
+        用户是 Java 开发者
+
+        # 项目信息
+        项目路径: /mnt/d/ws/local/agent-from-scratch-plus
+        当前分支: 06-final-review
+
+    Java 类比：Properties 文件 / YAML 配置，简单可靠
+    """
+
+    MEMORY_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "MEMORY.md")
+
+    def __init__(self, filepath: str = None):
+        self.filepath = filepath or self.MEMORY_FILE
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+
+    def save(self, key: str, value: str) -> None:
+        """
+        保存一条记忆
+
+        Args:
+            key: 记忆标识（如 "用户偏好"）
+            value: 记忆内容
+        """
+        entries = self._read_all()
+        entries[key] = value
+        self._write_all(entries)
+        print(f"  📝 MEMORY.md: {key} = {value[:50]}")
+
+    def load(self, key: str = None) -> str:
+        """
+        读取记忆
+
+        Args:
+            key: 可选，指定 key 则返回单条，否则返回全部
+
+        Returns:
+            str: 记忆内容
+        """
+        entries = self._read_all()
+        if key:
+            return entries.get(key, "")
+        # 返回全部，格式化为 prompt 可注入的文本
+        if not entries:
+            return ""
+        lines = ["## 用户记忆"]
+        for k, v in entries.items():
+            lines.append(f"- {k}: {v}")
+        return "\n".join(lines)
+
+    def delete(self, key: str) -> None:
+        """删除一条记忆"""
+        entries = self._read_all()
+        entries.pop(key, None)
+        self._write_all(entries)
+        print(f"  🗑  MEMORY.md: 删除 {key}")
+
+    def list_keys(self) -> list[str]:
+        """列出所有记忆的 key"""
+        return list(self._read_all().keys())
+
+    def _read_all(self) -> dict[str, str]:
+        """读取整个 MEMORY.md 文件，解析为 dict"""
+        if not os.path.exists(self.filepath):
+            return {}
+        entries = {}
+        current_key = None
+        with open(self.filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("- "):
+                    # 格式: "- 用户偏好: 喜欢简短回答"
+                    parts = line[2:].split(": ", 1)
+                    if len(parts) == 2:
+                        entries[parts[0]] = parts[1]
+        return entries
+
+    def _write_all(self, entries: dict[str, str]) -> None:
+        """将 dict 写回 MEMORY.md 文件"""
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            f.write("# MEMORY.md — Agent 持久化记忆\n")
+            f.write("# 此文件跨会话保留，Agent 每次启动时自动加载\n\n")
+            for k, v in entries.items():
+                f.write(f"- {k}: {v}\n")
+
+
+def _extract_message_fields(msg) -> tuple:
     """
     从 LangChain Message 对象或 dict 中提取 (role, content, tool_calls, tool_call_id)
 

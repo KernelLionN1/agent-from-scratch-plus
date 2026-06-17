@@ -271,6 +271,66 @@ class DynamicAgent:
             "messages": result["messages"],
         }
 
+    async def astream(self, user_input: str):
+        """
+        Day6: 流式运行 Agent，每步实时产出
+
+        用手动循环替代 LangGraph 的 invoke()，
+        每次 LLM 调用使用 astream() 逐 token 输出。
+
+        Yields:
+            {"type": "thinking", "step": 0}
+            {"type": "token", "content": "计"}
+            {"type": "tool_start", "name": "calculator", "args": {...}}
+            {"type": "tool_result", "name": "calculator", "result": "300"}
+            {"type": "done", "answer": "结果是300"}
+        """
+        from src.tools import get_tool_definitions, execute_tool
+        import json
+
+        tools = get_tool_definitions()
+        messages = [
+            {"role": "system", "content": "你是 ReAct Agent。计算问题必须调 calculator。"},
+            {"role": "user", "content": user_input},
+        ]
+
+        for step in range(self.max_steps):
+            yield {"type": "thinking", "step": step}
+
+            # 流式调 LLM
+            tool_calls_found = []
+            async for event in self.llm.astream(messages=messages, tools=tools):
+                yield event
+                if event["type"] == "done" and event.get("tool_calls"):
+                    tool_calls_found = event["tool_calls"]
+
+            # 没有 tool_calls → 结束
+            if not tool_calls_found:
+                return
+
+            # 执行工具
+            for tc in tool_calls_found:
+                yield {"type": "tool_start", "name": tc["name"], "args": tc.get("arguments", "{}")}
+                try:
+                    args = json.loads(tc["arguments"]) if isinstance(tc["arguments"], str) else tc["arguments"]
+                except json.JSONDecodeError:
+                    args = {}
+                result = execute_tool(tc["name"], args)
+                yield {"type": "tool_result", "name": tc["name"], "result": str(result)[:200]}
+
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": tc.get("id", ""),
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }],
+                })
+                messages.append({"role": "tool", "content": str(result), "tool_call_id": tc.get("id", "")})
+
+        yield {"type": "done", "answer": "达到最大步数限制"}
+
 
 # ── 便捷函数 ─────────────────────────────────────────────
 def run_dynamic_agent(question: str) -> dict:

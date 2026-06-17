@@ -112,6 +112,73 @@ class LLMClient:
         )
         return _to_dict(response)
 
+    async def astream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ):
+        """
+        Day6 新增：流式输出
+
+        使用 LangChain 的 astream_events() 逐 token 产出，
+        同时追踪完整的 tool_calls 累积。
+
+        Yields:
+            dict: {"type": "token", "content": "你"} 或
+                  {"type": "tool_call", "name": "calculator", "arguments": "..."} 或
+                  {"type": "done", "content": "完整回复", "usage": {...}}
+        """
+        self._llm.temperature = temperature
+        self._llm.max_tokens = max_tokens
+
+        if tools:
+            llm_with_tools = self._llm.bind_tools(
+                [_convert_tool_lc(t) for t in tools]
+            )
+        else:
+            llm_with_tools = self._llm
+
+        full_content = ""
+        tool_calls = []
+        current_tool = None
+
+        async for event in llm_with_tools.astream_events(
+            [_to_lc_message(m) for m in messages],
+            version="v2",
+        ):
+            kind = event.get("event")
+
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                # 文本 token
+                if chunk.content:
+                    full_content += chunk.content
+                    yield {"type": "token", "content": chunk.content}
+
+                # 工具调用增量
+                if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                    for tc in chunk.tool_call_chunks:
+                        if tc.get("name"):
+                            current_tool = {
+                                "name": tc["name"],
+                                "arguments": "",
+                                "id": tc.get("id", ""),
+                            }
+                            tool_calls.append(current_tool)
+                        if tc.get("args") and current_tool:
+                            current_tool["arguments"] += tc["args"]
+
+            elif kind == "on_chat_model_end":
+                # 流结束，发送完整结果
+                yield {
+                    "type": "done",
+                    "content": full_content,
+                    "tool_calls": tool_calls if tool_calls else None,
+                    "usage": {},
+                }
+
 
 # ── 格式转换工具函数（手搓 dict ↔ LangChain 对象）────────
 
