@@ -158,26 +158,45 @@ class ConversationMemory:
 
     def _estimate_tokens(self, messages: list[dict]) -> int:
         """
-        Token 数量估算 —— 极其粗糙，仅用于学习演示
+        Token 数量估算 —— Day3 修复 #7：区分中英文
 
-        使用最简单的公式：总字符数 / 4 ≈ token 数
-        问题：
-        - 中文一个字约 1-2 token，英文一个词约 1-2 token
-        - 这种估算法对中英文混合内容误差极大
-        - 实际工程应使用 tiktoken 库精确计算
+        修复前公式：总字符数 // 4  （英文约 0.25 token/字，中文约 1-2 token/字）
+        修复后公式：中文字数×0.7 + 其他字符×0.25
 
-        面试常问：如何精确计算 token？
-        答：用 tiktoken（OpenAI 开源库），它对每种模型有对应的编码器。
+        注意：这仍然是估算！精确计算需用 tiktoken 库。
+        tiktoken 安装：pip install tiktoken
+        用法：encoding = tiktoken.encoding_for_model("gpt-4")
+              tokens = len(encoding.encode(text))
         """
-        total_chars = 0
+        # ── 中文字符 Unicode 范围 ──
+        # \u4e00-\u9fff: 基本汉字
+        # \u3400-\u4dbf: 扩展 A 区
+        # \uf900-\ufaff: 兼容汉字
+        CJK_RANGES = [
+            (0x4e00, 0x9fff),
+            (0x3400, 0x4dbf),
+            (0xf900, 0xfaff),
+        ]
+
+        def _is_chinese(ch: str) -> bool:
+            """判断单个字符是否为中文"""
+            cp = ord(ch)
+            return any(lo <= cp <= hi for lo, hi in CJK_RANGES)
+
+        total_tokens = 0
         for msg in messages:
-            # content 可能是字符串可能是 None
             content = msg.get("content", "") or ""
-            total_chars += len(content)
-            # 如果有 tool_calls，把 JSON 也算进去
+            # 分别统计中英文
+            chinese_count = sum(1 for c in content if _is_chinese(c))
+            other_count = len(content) - chinese_count
+            # 中文约 0.7 token/字，英文约 0.25 token/字（取中值）
+            total_tokens += chinese_count * 0.7 + other_count * 0.25
+
+            # 如果有 tool_calls，JSON 按英文估算
             if msg.get("tool_calls"):
-                total_chars += len(str(msg["tool_calls"]))
-        return total_chars // 4
+                total_tokens += len(str(msg["tool_calls"])) * 0.25
+
+        return int(total_tokens)
 
     def clear(self):
         """清空所有记忆 —— 开始全新对话时调用"""

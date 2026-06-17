@@ -14,6 +14,7 @@
 
 # ── 导入依赖 ──────────────────────────────────────────────
 import json  # 用于解析 LLM 返回的 JSON 参数
+import re    # Day3 修复 #1：用正则做表达式白名单校验，替代裸 eval
 
 
 # ============================================================
@@ -117,21 +118,36 @@ def execute_tool(name: str, arguments: dict) -> str:
 # 第二部分：内置工具实现
 # ============================================================
 
-# ── 工具 1：计算器 ─────────────────────────────────────────
+# ── 工具 1：计算器（Day3 修复 #1：safe_eval 替代裸 eval）─
 def calculator(expression: str) -> float:
     """
-    计算器工具 —— 用 Python eval() 执行数学表达式
+    计算器工具 —— 用安全校验后的 eval() 执行数学表达式
 
-    刻意踩坑点（全保留，用于学习）：
-    1. 不做参数校验 —— 传 "hello" 进来会报错，传 "__import__('os').system('ls')" 会执行任意代码
-    2. 直接用 eval() —— Python eval 可以执行任意表达式，是著名安全漏洞
-    3. 没有 try/except —— 除零、语法错误等异常直接抛给调用方
+    Day3 修复 #1：从裸 eval() 升级为三步安全校验
+      步骤1: 白名单正则 — 只允许数字、运算符、括号、空格
+      步骤2: 受限命名空间 — {"__builtins__": {}} 禁止所有内置函数
+      步骤3: try/except 保护 — 除零等运行时错误转为友好提示
 
-    面试常问：eval() 有什么风险？应该怎么替代？
-    答：用 ast.literal_eval() 或手动解析数学表达式。
+    修复前风险：eval("__import__('os').system('ls')") 会直接执行系统命令
+    修复后行为：白名单校验不通过 → 抛出 ValueError
     """
-    # eval() 把字符串当 Python 代码执行 —— 简单但危险
-    return eval(expression)
+    # ── 步骤1：白名单字符校验 ──
+    # 只允许：数字(0-9)、小数点、四则运算符(+-*/)、幂(^)、
+    #         取模(%)、括号(())、空格、下划线
+    if not re.match(r'^[\d\s+\-*/()\.\%\^_]+$', expression):
+        raise ValueError(f"表达式包含不安全字符: '{expression}'")
+
+    # ── 步骤2+3：受限 eval + 异常保护 ──
+    try:
+        # __builtins__={} → 禁止所有内置函数（如 __import__, open, exec 等）
+        # 这样即使正则被绕过，eval 也无法执行任何函数调用
+        return eval(expression, {"__builtins__": {}}, {})
+    except ZeroDivisionError:
+        raise ValueError("除数不能为零")
+    except SyntaxError as e:
+        raise ValueError(f"表达式语法错误: {e}")
+    except Exception as e:
+        raise ValueError(f"计算失败: {e}")
 
 
 # 注册计算器工具 —— 模块加载时自动执行
@@ -166,31 +182,33 @@ _KNOWLEDGE_BASE = {
 }
 
 
-def search_knowledge(query: str) -> dict:
+def search_knowledge(query: str) -> str:
     """
-    文本查询工具 —— 从本地知识库中搜索
+    文本查询工具 —— 从本地知识库中搜索（Day3 修复 #2：返回格式化文本）
 
-    刻意踩坑点（全保留，用于学习）：
-    1. 返回 dict 而非字符串 —— LLM 收到 {"fastapi": "..."} 还需要二次理解
-    2. 搜索逻辑极其简陋 —— 仅做子串匹配，没有分词、没有相似度
-    3. 空结果返回 {} —— 不给友好提示，LLM 不知道是"没找到"还是"出错了"
-    4. 搜索方向错误 —— `query.lower() in key.lower()` 检查的是
-       "FastAPI 是什么" 是否在 "fastapi" 里（不可能），
-       正确的应该是反过来的方向或双向检查
+    Day3 修复 #2：返回类型从 dict 改为 str
+      修复前：return result  # dict → str() → "{'key': 'value'}"  LLM 难理解
+      修复后：return 格式化文本   # 每行 "[key]: value"，LLM 一目了然
+      空结果返回友好提示，而非空 dict
 
-    面试常问：如何改进这个搜索？
-    答：用嵌入向量（embedding）+ 余弦相似度做语义搜索，
-       或者至少用 jieba 分词 + TF-IDF。
+    仍保留的教学踩坑：
+    1. 搜索逻辑极其简陋 —— 仅做子串匹配
+    2. 搜索方向问题 —— query in key（反了），但加了 value 方向弥补
     """
     result = {}
-    # 遍历知识库所有条目 —— O(n) 复杂度，数据量大时性能很差
     for key, value in _KNOWLEDGE_BASE.items():
-        # 子串匹配 —— 这是最简陋的搜索方式
-        # 注意方向：query in key，即 "FastAPI 是什么" in "fastapi" → False
+        # 双向匹配：query 在 key 中，或 query 在 value 中
         if query.lower() in key.lower() or query.lower() in value.lower():
             result[key] = value
-    # 直接返回 dict —— LLM 需要自己解析这个结构
-    return result
+
+    # ── Day3 修复 #2：格式化为 LLM 友好的文本 ──
+    if not result:
+        return f"未找到与「{query}」相关的知识。知识库当前包含：{list(_KNOWLEDGE_BASE.keys())}"
+
+    lines = [f"搜索「{query}」的结果（{len(result)} 条）："]
+    for key, value in result.items():
+        lines.append(f"  [{key}]: {value}")
+    return "\n".join(lines)
 
 
 # 注册文本查询工具

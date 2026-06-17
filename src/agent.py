@@ -56,11 +56,15 @@ class ReActAgent:
         self.memory = ConversationMemory(max_messages=20, max_tokens=4000)
         self.truncation_strategy = truncation_strategy
 
-        # ── 系统提示词 ──
+        # ── 系统提示词（Day3 修复 #3：从"请求"改为"命令"）──
         self.system_prompt = (
-            "你是一个有用的 AI 助手。"
-            "当用户问需要计算或查询的问题时，请使用提供的工具。"
-            "使用工具获取结果后，用自然语言向用户解释结果。"
+            "你是 ReAct Agent，必须通过工具与外界交互。\n\n"
+            "核心规则（违反将导致错误结果）：\n"
+            "1. 计算类问题（如'XXX等于多少'、'算一下'）→ 必须调用 calculator 工具\n"
+            "2. 知识类问题（如'XXX是什么'、'介绍一下'）→ 必须调用 search_knowledge 工具\n"
+            "3. 不要用你自己的知识直接回答 —— 你的知识可能过时或不准确\n"
+            "4. 获取工具结果后，用自然语言向用户解释结果\n"
+            "5. 如果工具返回错误，如实告诉用户，不要编造答案\n"
         )
         # 系统提示词存入 memory —— 它始终在消息列表第一位
         self.memory.set_system(self.system_prompt)
@@ -141,20 +145,37 @@ class ReActAgent:
                     ],
                 )
 
-                # ── 执行工具 + 结果反馈 ──
+                # ── 执行工具 + 结果反馈（Day3 修复 #5：异常保护）──
                 for tc in response["tool_calls"]:
                     tool_name = tc["name"]
-                    tool_args = json.loads(tc["arguments"])
+                    # 参数解析保护：LLM 传的 arguments 可能不是合法 JSON
+                    try:
+                        tool_args = json.loads(tc["arguments"])
+                    except json.JSONDecodeError as e:
+                        tool_result = f"工具参数格式错误: {e}。请用正确的 JSON 格式重试，例如 {{\"expression\": \"1+2\"}}"
+                        print(f"  [Agent] ⚠️ {tool_result}")
+                        self.memory.add_tool_result(
+                            tool_call_id=tc["id"],
+                            tool_name=tool_name,
+                            result=tool_result,
+                        )
+                        continue
 
                     print(f"  [Agent] 🔧 调用工具: {tool_name}({tool_args})")
 
-                    tool_result = execute_tool(tool_name, tool_args)
+                    # 工具执行保护：捕获所有异常，把错误信息反馈给 LLM
+                    try:
+                        tool_result = execute_tool(tool_name, tool_args)
+                    except Exception as e:
+                        tool_result = f"工具执行失败 ({type(e).__name__}): {e}"
+                        print(f"  [Agent] ⚠️ {tool_result}")
+
                     print(f"  [Agent] 📤 工具结果: {tool_result}")
 
                     self.memory.add_tool_result(
                         tool_call_id=tc["id"],
                         tool_name=tool_name,
-                        result=tool_result,
+                        result=str(tool_result),
                     )
                 # ── 工具执行完，继续循环让 LLM 看结果 ──
                 continue
