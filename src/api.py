@@ -8,13 +8,19 @@ FastAPI 接口层 —— 把 Agent 封装成 HTTP 服务
 - 无并发隔离 → 用户 A 的问题可能污染用户 B 的对话
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-import asyncio  # Day3 修复 #9：async/await + 超时控制
+import asyncio
+import traceback  # Day3 阶段四：异常处理器日志
 
 # ── 导入我们的 Agent ──
 from src.agent import ReActAgent
 from src.llm_client import LLMClient  # Day3 修复：健康检查用
+# Day3 阶段四：多 Agent 编排
+from src.orchestrator import Orchestrator
+from src.message_bus import MessageBus
+import uuid  # 任务 ID 生成
 
 # ── 创建 FastAPI 应用 ──
 app = FastAPI(
@@ -22,6 +28,32 @@ app = FastAPI(
     description="从零手搓的 ReAct Agent HTTP 服务",
     version="0.1.0",
 )
+
+# ═══════════════════════════════════════════════════════════
+# Day3 阶段四：全局异常处理器（AOP 统一接管）
+# 等价于 Spring 的 @ControllerAdvice —— 所有端点自动继承
+# ═══════════════════════════════════════════════════════════
+
+@app.exception_handler(asyncio.TimeoutError)
+async def timeout_exception_handler(request: Request, exc: asyncio.TimeoutError):
+    """asyncio.TimeoutError → HTTP 504"""
+    print(f"[API] ⏰ 超时: {request.method} {request.url.path}")
+    return JSONResponse(status_code=504, content={"detail": "请求超时，请简化问题后重试"})
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """HTTPException 透传（保留端点手动抛出的 404 等状态码）"""
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """兜底：未捕获异常 → HTTP 500，打印堆栈方便排查"""
+    print(f"[API] 💥 异常: {request.method} {request.url.path} — {type(exc).__name__}: {exc}")
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": f"服务器内部错误: {type(exc).__name__}"})
+
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║  Day3 修复 #8：不再使用全局 Agent 实例！                   ║
@@ -87,6 +119,20 @@ class ErrorResponse(BaseModel):
     detail: str = Field(description="错误详情")
 
 
+# Day3 阶段四：编排请求模型
+class OrchestrateRequest(BaseModel):
+    """
+    多 Agent 编排请求
+
+    mode: "serial" — Planner→Coder→Reviewer→Coder(修复)
+          "parallel" — Planner→[Coder1,Coder2,...]→Reviewer
+    """
+    requirement: str = Field(..., min_length=1, max_length=2000, description="用户需求")
+    mode: str = Field(default="serial", description="编排模式：serial 或 parallel")
+    n_coders: int = Field(default=2, ge=1, le=5, description="并行 Coder 数量")
+    with_fix: bool = Field(default=True, description="串行模式是否执行修复步骤")
+
+
 # ═══════════════════════════════════════════════════════════
 # API 端点
 # ═══════════════════════════════════════════════════════════
@@ -141,27 +187,13 @@ async def chat(request: ChatRequest) -> ChatResponse:  # Day3 修复 #9: async d
              -H "Content-Type: application/json" \\
              -d '{"message": "帮我计算 123 * 456"}'
     """
-    try:
-        # Day3 修复 #8：每个请求创建新 Agent，而非共享全局实例
-        agent = create_agent()
-
-        # Day3 修复 #9：async + 超时
-        # asyncio.to_thread: 把同步 agent.run() 丢进线程池，不阻塞事件循环
-        # asyncio.wait_for: 加 60s 超时，防止 LLM 卡住时请求永久挂起
-        answer = await asyncio.wait_for(
-            asyncio.to_thread(agent.run, request.message),
-            timeout=60.0,
-        )
-        return ChatResponse(answer=answer, status="ok")
-
-    except asyncio.TimeoutError:
-        # Day3 修复 #9：超时返回 504，而非让请求永久挂起
-        raise HTTPException(
-            status_code=504,
-            detail="请求超时（60s），请简化问题后重试",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent 错误: {str(e)}")
+    agent = create_agent()
+    answer = await asyncio.wait_for(
+        asyncio.to_thread(agent.run, request.message),
+        timeout=60.0,
+    )
+    return ChatResponse(answer=answer, status="ok")
+    # 异常由全局处理器自动接管（TimeoutError→504, Exception→500）
 
 
 @app.post("/chat/reset")
@@ -178,7 +210,95 @@ async def reset_chat():  # Day3 修复 #9: async def
     }
 
 
-# ── 模块自测说明 ─────────────────────────────────────────
+@app.post(
+    "/chat/orchestrate",
+    responses={
+        200: {"description": "编排成功"},
+        500: {"model": ErrorResponse, "description": "编排失败"},
+        504: {"model": ErrorResponse, "description": "编排超时"},
+    },
+)
+async def orchestrate(request: OrchestrateRequest):
+    """
+    Day3 阶段四：多 Agent 编排端点
+
+    支持两种模式：
+    - serial:   Planner → Coder → Reviewer → Coder(修复)
+    - parallel: Planner → [Coder1, Coder2, ...] → Reviewer
+
+    用法：
+        curl -X POST http://localhost:8000/chat/orchestrate \\
+             -H "Content-Type: application/json" \\
+             -d '{"requirement": "实现冒泡排序和二分查找", "mode": "serial"}'
+    """
+    bus = MessageBus()
+    orch = Orchestrator(bus)
+
+    if request.mode == "serial":
+        result = await asyncio.wait_for(
+            asyncio.to_thread(orch.run_serial, request.requirement, request.with_fix),
+            timeout=180.0,
+        )
+        return {
+            "status": "ok", "mode": "serial",
+            "plan": result["plan"],
+            "code": result.get("code", ""),
+            "review": result.get("review", ""),
+            "fixed_code": result.get("fixed_code", ""),
+            "stats": result.get("stats", {}),
+        }
+
+    else:  # parallel
+        result = await asyncio.wait_for(
+            asyncio.to_thread(orch.run_parallel, request.requirement, request.n_coders),
+            timeout=180.0,
+        )
+        codes = [c for c in result.get("codes", []) if not isinstance(c, Exception)]
+        return {
+            "status": "ok", "mode": "parallel",
+            "plan": result["plan"],
+            "codes": codes,
+            "combined": result.get("combined", ""),
+            "review": result.get("review", ""),
+            "timing": result.get("timing", {}),
+        }
+    # 异常由全局处理器自动接管（TimeoutError→504, Exception→500）
+
+# ── Day3 阶段四：编排任务进度存储（内存）──
+_orchestrate_tasks: dict[str, dict] = {}
+
+
+@app.get("/chat/progress/{task_id}")
+async def get_progress(task_id: str):
+    """
+    Day3 阶段四：查询编排任务进度
+
+    用法：
+        curl http://localhost:8000/chat/progress/<task_id>
+    """
+    task = _orchestrate_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+    return {
+        "task_id": task_id,
+        "status": task.get("status", "unknown"),
+        "phase": task.get("phase", ""),
+        "progress": task.get("progress", {}),
+    }
+
+
+@app.get("/chat/progress")
+async def list_progress():
+    """
+    列出所有编排任务进度（调试用）
+    """
+    return {
+        "count": len(_orchestrate_tasks),
+        "tasks": {
+            tid: {"status": t.get("status"), "phase": t.get("phase")}
+            for tid, t in _orchestrate_tasks.items()
+        },
+    }
 # 不要直接 python src/api.py，用 uvicorn 启动：
 #   uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
 # 或直接运行 main.py
