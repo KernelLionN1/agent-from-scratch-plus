@@ -125,6 +125,66 @@ class SharedState:
             self._set_count += 1
             return True
 
+    def update_with_retry(self, key: str, compute_new_value, max_retries: int = 3) -> bool:
+        """
+        Day3 修复 #13：乐观锁更新 + 自动重试
+
+        三步循环（Read → Compute → Write）：
+          ① 读最新值 + 当前版本号（加锁）
+          ② 计算新值（无锁，不阻塞读）
+          ③ 加锁，检查版本号：匹配→写入成功 / 不匹配→回到①
+
+        参数：
+            key:                键名
+            compute_new_value:  计算新值的函数。
+                               接收当前最新值，返回要写入的新值。
+                               例: lambda v: (v or 0) + 1
+            max_retries:        最大重试次数（默认 3）
+
+        返回：
+            True:  更新成功
+            False: max_retries 次后仍然版本冲突
+
+        使用示例：
+            # 对 counter 执行 +1 操作（原子安全）
+            state.update_with_retry("counter", lambda v: (v or 0) + 1)
+
+        Java 类比：@Version + @Retryable(maxAttempts=3)
+        """
+        for attempt in range(1, max_retries + 1):
+            # ── 步骤①：读最新值 + 版本号（加锁）──
+            with self._lock:
+                current_value = deepcopy(self._data.get(key))
+                current_version = self._version
+
+            # ── 步骤②：计算新值（无锁，不阻塞其他读操作）──
+            try:
+                new_value = compute_new_value(current_value)
+            except Exception as e:
+                # 计算函数出错了，直接记录失败
+                print(f"  [SharedState] update_with_retry: 计算新值失败: {e}")
+                return False
+
+            # ── 步骤③：尝试写入（加锁）──
+            with self._lock:
+                if self._version == current_version:
+                    # 版本没变 → 写入成功！
+                    self._data[key] = deepcopy(new_value)
+                    self._version += 1
+                    self._set_count += 1
+                    return True
+                else:
+                    # 版本变了 → 被其他 Agent 抢先了
+                    self._conflict_count += 1
+                    if attempt < max_retries:
+                        # 等一小段随机时间再重试（避免活锁）
+                        time.sleep(0.01 * attempt)
+                        # continue 到下一次循环
+                    # 最后一次尝试也失败了 → 返回 False
+
+        # 所有重试耗尽
+        return False
+
     # ═══════════════════════════════════════════════════════
     # 【踩坑】不安全操作
     # ═══════════════════════════════════════════════════════

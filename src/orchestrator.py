@@ -326,13 +326,28 @@ class Orchestrator:
         coders = [CoderAgent(self.bus, f"coder-{i+1}") for i in range(len(subtasks))]
 
         # asyncio.gather：同时启动所有协程，等全部完成
-        # 相当于 Java 的 CompletableFuture.allOf()
+        # Day3 修复 #11：return_exceptions=True → 一个 Coder 挂了不影响其他
         async def _run_all():
             tasks = [
                 self._coder_async(coders[i], subtasks[i], i + 1)
                 for i in range(len(subtasks))
             ]
-            return await asyncio.gather(*tasks)
+            # return_exceptions=True: 异常不抛出，作为返回值的一部分
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # 分离成功和异常结果
+            codes = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    print(f"  ⚠️ Coder{i+1} 失败: {r}（已隔离，不影响其他 Coder）")
+                    codes.append({
+                        "task_id": i + 1,
+                        "subtask": subtasks[i],
+                        "code": f"# [错误] Coder{i+1} 执行失败: {r}",
+                        "error": str(r),
+                    })
+                else:
+                    codes.append(r)
+            return codes
 
         # 启动事件循环并等待全部完成
         codes = asyncio.run(_run_all())
@@ -438,16 +453,48 @@ class Orchestrator:
                 self._coder_async(coders[i], subtasks[i], i + 1)
                 for i in range(len(subtasks))
             ]
-            try:
-                # 【踩坑】wait_for 超时后直接抛异常，已完成的结果也丢了
-                return await asyncio.wait_for(
-                    asyncio.gather(*tasks),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                print(f"   ⏰ 超时！({timeout}s)")
-                # 【踩坑】不收集已完成的部分结果，全部丢弃
-                return []
+            # Day3 修复 #12：用 asyncio.wait 代替 asyncio.wait_for
+            # wait_for 超时后抛异常，丢弃所有结果
+            # wait 超时后返回 (done, pending)，已完成的不丢
+            # ensure_future：把协程包装成 Task，asyncio.wait 需要 Future 类型
+            future_tasks = [asyncio.ensure_future(t) for t in tasks]
+            done, pending = await asyncio.wait(
+                future_tasks,
+                timeout=timeout,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+
+            # 取消还在跑的任务
+            for task in pending:
+                task.cancel()
+                print(f"  ⏰ 任务超时被取消")
+
+            # 按原始顺序收集结果（包括已完成和超时的）
+            codes = []
+            for i, future_t in enumerate(future_tasks):
+                if future_t in done:
+                    try:
+                        result = future_t.result()
+                        codes.append(result)
+                        print(f"  ✅ Coder{i+1} 完成")
+                    except Exception as e:
+                        print(f"  ⚠️ Coder{i+1} 异常: {e}")
+                        codes.append({
+                            "task_id": i + 1,
+                            "subtask": subtasks[i],
+                            "code": f"# [错误] {e}",
+                            "error": str(e),
+                        })
+                else:
+                    print(f"  ⏰ Coder{i+1} 超时")
+                    codes.append({
+                        "task_id": i + 1,
+                        "subtask": subtasks[i],
+                        "code": f"# [超时] Coder{i+1} 未在 {timeout}s 内完成",
+                        "error": "timeout",
+                    })
+
+            return codes
 
         t0 = time.time()
         codes = asyncio.run(_run_with_timeout())
@@ -592,21 +639,27 @@ class Orchestrator:
                 self._coder_async(coders[i], subtasks[i], i + 1)
                 for i in range(len(subtasks))
             ]
-            return await asyncio.gather(*tasks)  # 【踩坑】不用 return_exceptions
+            return await asyncio.gather(*tasks, return_exceptions=True)  # Day3 修复 #11
 
         codes = asyncio.run(_run_all())
         timing["coders"] = time.time() - t0
 
+        # Day3 修复 #11：过滤掉异常，只保留成功结果
+        valid_codes = [c for c in codes if not isinstance(c, BaseException)]
+        error_count = len(codes) - len(valid_codes)
+        if error_count > 0:
+            print(f"  ⚠️ {error_count} 个 Coder 失败，{len(valid_codes)} 个成功")
+
         # 记录各 Coder 的结果到状态
-        for c in codes:
+        for c in valid_codes:
             self.shared_state.set(f"code_task{c['task_id']}", c["code"][:500])
         self.shared_state.mark_task_done("coders", 0,
-                                         f"{len(codes)} 个 Coder 完成")
+                                         f"{len(valid_codes)}/{len(codes)} 个 Coder 完成")
 
-        # ── 汇总 ──
+        # ── 汇总 ──（只用有效结果）
         combined = "\n\n".join([
             f"# === 子任务 {c['task_id']} ===\n{c['code']}"
-            for c in codes
+            for c in valid_codes
         ])
         self.shared_state.set("combined", combined[:2000])
 

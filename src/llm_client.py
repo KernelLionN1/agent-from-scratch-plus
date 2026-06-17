@@ -11,8 +11,18 @@ LLM 客户端封装 —— 对接 DeepSeek API（OpenAI 兼容协议）
 
 # ── 导入依赖 ──────────────────────────────────────────────
 import os
+import time  # Day3 修复 #10：指数退避重试用
 from dotenv import load_dotenv  # 从 .env 文件读取环境变量
 from openai import OpenAI        # OpenAI SDK，兼容 DeepSeek
+# Day3 修复 #10：按可重试/不可重试分类 OpenAI 异常
+from openai import (
+    APITimeoutError,       # 网络超时 — 可重试
+    RateLimitError,        # 429 限流 — 可重试
+    APIConnectionError,    # 连接失败 — 可重试
+    InternalServerError,   # 5xx — 可重试
+    AuthenticationError,   # 401 — 不可重试
+    BadRequestError,       # 400 — 不可重试
+)
 
 # 模块加载时自动读取 .env 文件，之后 os.getenv() 就能拿到配置
 load_dotenv()
@@ -21,7 +31,12 @@ load_dotenv()
 # ── LLM 客户端类 ──────────────────────────────────────────
 class LLMClient:
     """
-    封装 DeepSeek API 调用
+    封装 DeepSeek API 调用（Day3 修复 #10：加重试机制）
+
+    Day3 修复 #10：从裸调升级为指数退避重试
+      可重试错误（网络抖动）：超时/429限流/连接失败/5xx → 最多 3 次重试
+      不可重试错误（参数/认证）：401/400 → 直接抛，不浪费重试
+      退避间隔：1s → 2s → 4s（指数增长，防止惊群效应）
 
     使用方式：
         client = LLMClient()
@@ -55,70 +70,99 @@ class LLMClient:
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
+        max_retries: int = 3,  # Day3 修复 #10：最大重试次数
     ) -> dict:
         """
-        调用 LLM，返回统一格式的 dict
-
-        这是整个 Agent 系统最核心的方法 —— 所有 LLM 交互都走这里。
+        调用 LLM（Day3 修复 #10：失败时指数退避重试）
 
         参数：
-            messages:   对话历史，OpenAI 格式 [{"role":"user","content":"..."}]
-            tools:      可选，工具定义列表。传了就开启 function calling
-            temperature: 0~2，越高越随机。0=确定性强，适合代码/数学
-            max_tokens:  限制 LLM 最大输出长度，防止无限生成
+            messages:   对话历史
+            tools:      可选工具定义
+            temperature: 0~2
+            max_tokens:  最大输出长度
+            max_retries: 最大重试次数（默认 3）
 
-        返回：统一 dict，外部不需要关心里面是怎么解析的
-            {
-                "content":    str | None,   # LLM 直接回复的文本
-                "tool_calls": list | None,  # LLM 想调用的工具列表
-                "model":      str,          # 实际使用的模型名
-                "usage":      dict,         # {"prompt_tokens", "completion_tokens", "total_tokens"}
-            }
+        返回：统一 dict {content, tool_calls, model, usage}
 
-        content 和 tool_calls 互斥：LLM 要么说话要么调工具，不会同时做两件事。
+        重试策略（Day3 修复 #10）：
+            - 可重试：APITimeoutError / RateLimitError / APIConnectionError / InternalServerError
+            - 不可重试：AuthenticationError / BadRequestError → 直接抛
+            - 退避间隔：2^0=1s → 2^1=2s → 2^2=4s
+            - 3 次全部失败后抛 RuntimeError
         """
-        # ── 构建请求参数 ──
-        # 相当于 Java 里构建一个 Request DTO
+        # ── 构建请求参数（不变）──
         kwargs = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        # 如果有工具定义就带上 —— 这告诉 LLM "你可以用这些工具"
         if tools:
             kwargs["tools"] = tools
 
-        # ── 发出 HTTP 请求 ──
-        # 底层：POST https://api.deepseek.com/v1/chat/completions
-        # 请求体是 JSON，响应体也是 JSON
-        # OpenAI SDK 帮我们做了序列化/反序列化
-        response = self.client.chat.completions.create(**kwargs)
+        # ═══════════════════════════════════════════════════
+        # Day3 修复 #10：指数退避重试循环
+        # ═══════════════════════════════════════════════════
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                # ── 发出 HTTP 请求 ──
+                response = self.client.chat.completions.create(**kwargs)
 
-        # ── 解析响应 ──
-        # response.choices 是一个列表（通常只有一个元素）
-        choice = response.choices[0]
-        msg = choice.message  # OpenAI SDK 的消息对象
+                # 成功 → 解析返回
+                return _parse_chat_response(response)
 
-        # ── 构建统一返回格式 ──
-        # 把 SDK 对象转成纯 dict，外部调用方不需要 import openai
-        return {
-            # msg.content 可能是 None（当 LLM 决定调工具时）
-            "content": msg.content,
-            # 从 message 对象里提取 tool_calls，封装成自己的格式
-            "tool_calls": _parse_tool_calls(msg),
-            # 记录实际使用的模型（DeepSeek 内部可能做模型路由）
-            "model": response.model,
-            # token 用量 —— 方便做成本监控
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-                "total_tokens": response.usage.total_tokens if response.usage else 0,
-            },
-        }
+            except (AuthenticationError, BadRequestError) as e:
+                # 不可重试：API Key 错了、参数格式不对 → 重试没用
+                raise RuntimeError(
+                    f"LLM 调用失败（不可重试）: {type(e).__name__}: {e}"
+                )
+
+            except (APITimeoutError, RateLimitError, APIConnectionError,
+                    InternalServerError) as e:
+                # 可重试：网络抖动 / 限流 / 服务端临时故障
+                last_error = e
+                if attempt < max_retries:
+                    wait = 2 ** (attempt - 1)  # 指数退避: 1s → 2s → 4s
+                    print(f"  [LLM] {type(e).__name__}，{wait}s 后重试 ({attempt}/{max_retries})...")
+                    time.sleep(wait)
+                else:
+                    print(f"  [LLM] 已重试 {max_retries} 次，全部失败")
+
+        # 所有重试耗尽
+        raise RuntimeError(
+            f"LLM 调用失败（已重试 {max_retries} 次）: "
+            f"{type(last_error).__name__}: {last_error}"
+        )
 
 
-# ── 工具函数：解析 LLM 的工具调用请求 ─────────────────────
+# ── 工具函数：解析 LLM 响应 ─────────────────────────────
+def _parse_chat_response(response) -> dict:
+    """
+    Day3 修复 #10：从 chat() 内联提取为独立函数
+
+    把 OpenAI SDK 的 response 对象转成统一的 dict 格式，
+    外部调用方不需要 import openai。
+    """
+    choice = response.choices[0]
+    msg = choice.message
+
+    return {
+        # msg.content 可能是 None（当 LLM 决定调工具时）
+        "content": msg.content,
+        # 从 message 对象里提取 tool_calls
+        "tool_calls": _parse_tool_calls(msg),
+        # 记录实际使用的模型
+        "model": response.model,
+        # token 用量
+        "usage": {
+            "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+            "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+            "total_tokens": response.usage.total_tokens if response.usage else 0,
+        },
+    }
+
+
 def _parse_tool_calls(message) -> list[dict] | None:
     """
     从 OpenAI 的 message 对象中提取 tool_calls
