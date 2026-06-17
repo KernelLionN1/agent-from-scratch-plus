@@ -69,6 +69,11 @@ class BaseAgent:
         # 这意味着一个 Agent 可以读到发给其他 Agent 的消息
         self.bus = bus
 
+        # ── 共享状态 ──（阶段四新增，可选）
+        # 如果 Orchestrator 传了 SharedState，Agent 可以读写全局进度
+        # 如果没传（如阶段二的用法），Agent 正常运行不受影响
+        self.shared_state = None  # 由 Orchestrator 在创建 Agent 后设置
+
     # ═══════════════════════════════════════════════════════
     # 子类必须实现的抽象方法
     # ═══════════════════════════════════════════════════════

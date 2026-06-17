@@ -18,6 +18,7 @@
 
 from src.message_bus import MessageBus, Message
 from src.agents import PlannerAgent, CoderAgent, ReviewerAgent
+from src.shared_state import SharedState  # 阶段四新增
 
 # 阶段三新增：异步并行支持
 import asyncio
@@ -36,12 +37,13 @@ class Orchestrator:
         result = orch.run_serial("实现一个排序算法")
     """
 
-    def __init__(self, bus: MessageBus):
+    def __init__(self, bus: MessageBus, with_shared_state: bool = False):
         """
         初始化编排器
 
         参数：
-            bus: 共享的消息总线
+            bus:               共享的消息总线
+            with_shared_state: 是否启用全局状态管理（阶段四）
         """
         self.bus = bus
 
@@ -50,6 +52,14 @@ class Orchestrator:
         self.planner = PlannerAgent(bus, "planner-1")
         self.coder = CoderAgent(bus, "coder-1")
         self.reviewer = ReviewerAgent(bus, "reviewer-1")
+
+        # ── 共享状态 ──（阶段四新增）
+        self.shared_state: SharedState | None = None
+        if with_shared_state:
+            self.shared_state = SharedState()
+            # 注入到所有 Agent
+            for agent in [self.planner, self.coder, self.reviewer]:
+                agent.shared_state = self.shared_state
 
         # 执行统计
         self.stats = {
@@ -454,6 +464,236 @@ class Orchestrator:
             "timing": {"total": elapsed},
             "timeout": timeout,
         }
+
+    # ═══════════════════════════════════════════════════════
+    # 阶段四：带状态追踪的编排
+    # ═══════════════════════════════════════════════════════
+
+    def run_serial_with_state(self, requirement: str) -> dict:
+        """
+        串行编排 + 全局状态追踪
+
+        在 run_serial 的基础上，每一步都通过 SharedState 记录进度。
+        外部可以随时通过 shared_state.get_progress() 查看当前状态。
+
+        要求：创建 Orchestrator 时 with_shared_state=True
+        """
+        if not self.shared_state:
+            raise RuntimeError("需要 with_shared_state=True 创建 Orchestrator")
+
+        print("\n" + "=" * 60)
+        print(f"🚀 串行编排（带状态追踪）：{requirement[:50]}...")
+        print("=" * 60)
+
+        # ── 初始化进度 ──
+        self.shared_state.init_progress(4)  # 4 个步骤
+        self.shared_state.set("requirement", requirement)
+        self.shared_state.set("phase", "planning")
+
+        # ── 步骤 1：Planner ──
+        print("\n📋 步骤 1/4：Planner 拆分需求...")
+        plan = self.planner.execute(requirement)
+        self.shared_state.set("phase", "coding")
+        self.shared_state.mark_task_done("planner", 1, f"规划完成，{len(plan)}字")
+        # 【踩坑】记录 Planner 输出到状态中
+        self.shared_state.set("plan", plan)
+        self.stats["plan_chars"] = len(plan)
+
+        # ── 步骤 2：Coder ──
+        print("\n💻 步骤 2/4：Coder 生成代码...")
+        code = self.coder.execute(plan)
+        self.shared_state.mark_task_done("coder-1", 2, f"代码生成完成，{len(code)}字")
+        self.shared_state.set("code", code)
+        self.stats["code_chars"] = len(code)
+
+        # ── 步骤 3：Reviewer ──
+        print("\n🔍 步骤 3/4：Reviewer 审核代码...")
+        self.shared_state.set("phase", "reviewing")
+        review = self.reviewer.execute(code)
+        self.shared_state.mark_task_done("reviewer", 3, f"审核完成，{len(review)}字")
+        self.shared_state.set("review", review)
+        self.stats["review_chars"] = len(review)
+
+        # ── 步骤 4：Coder 修复 ──
+        print("\n🔧 步骤 4/4：Coder 修复代码...")
+        self.shared_state.set("phase", "fixing")
+        fixed_code = self.coder.fix_code(review)
+        self.shared_state.mark_task_done("coder-1", 4, f"修复完成，{len(fixed_code)}字")
+        self.shared_state.set("fixed_code", fixed_code)
+        self.stats["fixed_code_chars"] = len(fixed_code)
+
+        # ── 完成 ──
+        self.shared_state.set("phase", "done")
+
+        print("\n" + "=" * 60)
+        print("✅ 串行编排完成（状态已记录）")
+        progress = self.shared_state.get_progress()
+        print(f"   进度: {progress.get('completed')}/{progress.get('total')}")
+        print("=" * 60)
+
+        return {
+            "plan": plan,
+            "code": code,
+            "review": review,
+            "fixed_code": fixed_code,
+            "stats": dict(self.stats),
+            "state_snapshot": self.shared_state.snapshot(),
+        }
+
+    def run_parallel_with_state(self, requirement: str, n_coders: int = 2) -> dict:
+        """
+        并行编排 + 全局状态追踪
+
+        在 run_parallel 的基础上，用 SharedState 追踪各 Coder 的进度。
+
+        要求：创建 Orchestrator 时 with_shared_state=True
+        """
+        if not self.shared_state:
+            raise RuntimeError("需要 with_shared_state=True 创建 Orchestrator")
+
+        import time
+
+        print("\n" + "=" * 60)
+        print(f"🚀 并行编排（带状态追踪）：{requirement[:50]}...")
+        print("=" * 60)
+
+        timing = {}
+
+        # ── 初始化进度 ──
+        self.shared_state.set("requirement", requirement)
+        self.shared_state.set("phase", "planning")
+        self.shared_state.init_progress(3)  # planner / coders / reviewer 三个阶段
+
+        # ── 步骤 1：Planner ──
+        print("\n📋 步骤 1/3：Planner 拆分需求...")
+        t0 = time.time()
+        plan = self.planner.execute(requirement)
+        timing["plan"] = time.time() - t0
+        self.shared_state.set("plan", plan)
+        self.shared_state.set("phase", "coding")
+        self.shared_state.mark_task_done("planner", 1, f"规划完成，{len(plan)}字")
+
+        # 提取子任务
+        subtasks = self._parse_subtasks(plan)
+        if len(subtasks) > n_coders:
+            subtasks = subtasks[:n_coders]
+
+        # ── 步骤 2：并行 Coder ──
+        print(f"\n💻 步骤 2/3：{len(subtasks)} 个 Coder 并行生成代码...")
+        t0 = time.time()
+
+        coders = [CoderAgent(self.bus, f"coder-{i+1}") for i in range(len(subtasks))]
+        # 注入 SharedState 到动态创建的 Coders
+        for c in coders:
+            c.shared_state = self.shared_state
+
+        async def _run_all():
+            tasks = [
+                self._coder_async(coders[i], subtasks[i], i + 1)
+                for i in range(len(subtasks))
+            ]
+            return await asyncio.gather(*tasks)  # 【踩坑】不用 return_exceptions
+
+        codes = asyncio.run(_run_all())
+        timing["coders"] = time.time() - t0
+
+        # 记录各 Coder 的结果到状态
+        for c in codes:
+            self.shared_state.set(f"code_task{c['task_id']}", c["code"][:500])
+        self.shared_state.mark_task_done("coders", 0,
+                                         f"{len(codes)} 个 Coder 完成")
+
+        # ── 汇总 ──
+        combined = "\n\n".join([
+            f"# === 子任务 {c['task_id']} ===\n{c['code']}"
+            for c in codes
+        ])
+        self.shared_state.set("combined", combined[:2000])
+
+        # ── 步骤 3：Reviewer ──
+        print(f"\n🔍 步骤 3/3：Reviewer 审核...")
+        self.shared_state.set("phase", "reviewing")
+        t0 = time.time()
+        review = self.reviewer.execute(combined)
+        timing["review"] = time.time() - t0
+        self.shared_state.set("review", review)
+        self.shared_state.mark_task_done("reviewer", 3, f"审核完成，{len(review)}字")
+        self.shared_state.set("phase", "done")
+
+        print("\n" + "=" * 60)
+        print("✅ 并行编排完成（状态已记录）")
+        progress = self.shared_state.get_progress()
+        print(f"   进度: {progress.get('completed')}/{progress.get('total')}")
+        print("=" * 60)
+
+        return {
+            "plan": plan,
+            "codes": codes,
+            "combined": combined,
+            "review": review,
+            "timing": timing,
+            "state_snapshot": self.shared_state.snapshot(),
+        }
+
+    def demonstrate_concurrent_conflict(self) -> dict:
+        """
+        【踩坑演示】模拟两个 Agent 同时更新状态导致版本冲突
+
+        不调 LLM，纯逻辑演示乐观锁冲突的场景。
+        """
+        if not self.shared_state:
+            raise RuntimeError("需要 with_shared_state=True 创建 Orchestrator")
+
+        print("\n" + "=" * 60)
+        print("【踩坑演示】并发状态冲突")
+        print("=" * 60)
+
+        results = {}
+
+        # ── 场景 1：乐观锁正常 ──
+        print("\n场景 1：乐观锁正常更新")
+        v = self.shared_state.set("counter", 0)
+        print(f"  初始版本: {v}, counter=0")
+        ok = self.shared_state.update("counter", 1, expected_version=v)
+        print(f"  update(counter=1, v={v}) → {'✅ 成功' if ok else '❌ 失败'}")
+        results["optimistic_ok"] = ok
+
+        # ── 场景 2：版本冲突 ──
+        print("\n场景 2：版本冲突（Agent A 和 B 同时改）")
+        v_a = self.shared_state.set("shared_counter", 0)
+        print(f"  Agent A 读到版本 {v_a}，counter=0")
+        # Agent B 抢先改了 —— 这次是真的调 set()
+        self.shared_state.set("shared_counter", 999)
+        print(f"  Agent B 抢先改了 → set(shared_counter, 999)，版本变成 {self.shared_state.get_version()}")
+        # A 用旧版本号尝试更新 → 冲突！
+        ok = self.shared_state.update("shared_counter", 42, expected_version=v_a)
+        print(f"  Agent A 尝试 update(counter=42, v={v_a}) → {'✅ 成功' if ok else '⚠️ 冲突（预期）'}")
+        assert self.shared_state.get("shared_counter") == 999, "值应该是 B 的结果"
+        results["version_conflict"] = not ok
+
+        # ── 场景 3：【踩坑】绕过锁直接改 ──
+        print("\n场景 3：【踩坑】绕过锁直接修改（bypass_lock）")
+        v_before = self.shared_state.get_version()
+        self.shared_state.set("protected_data", "正常写入的值")
+        print(f"  正常 set: protected_data = '正常写入的值', 版本 {self.shared_state.get_version()}")
+        # 绕过锁直接改
+        self.shared_state.bypass_lock("protected_data", "被悄悄覆盖了！")
+        v_after = self.shared_state.get_version()
+        print(f"  bypass_lock: protected_data = '{self.shared_state.get('protected_data')}'")
+        print(f"  版本号变化: {v_before} → {v_after}")
+        print(f"  ⚠️ 值被覆盖了，但版本号没递增！乐观锁失效！")
+        results["bypass_pitfall"] = self.shared_state.get("protected_data") == "被悄悄覆盖了！"
+
+        # ── 场景 4：并发写入无锁保护 ──
+        print(f"\n场景 4：最终的 SharedState 统计")
+        print(f"  {self.shared_state}")
+
+        print("\n" + "=" * 60)
+        all_ok = all(results.values())
+        print(f"  {'✅ 所有踩坑已确认' if all_ok else '⚠️ 部分验证失败'}")
+        print("=" * 60)
+
+        return results
 
     # ═══════════════════════════════════════════════════════
     # 工具方法
