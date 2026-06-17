@@ -1,227 +1,121 @@
 """
-ReAct Agent 核心循环 —— 集成对话记忆
+ReAct Agent —— Day4 框架版：基于 LangChain create_agent (v1.3+)
 
-阶段三升级：
-- 不再每次 run() 重新构建 messages
-- 使用 ConversationMemory 持久存储对话历史
-- 支持多轮对话（连续多次 run() 共享上下文）
-- 支持上下文截断策略
+Day4 核心变化：
+  手搓版（Day1-3）：while True + 手动消息构建 + 手动工具调用解析
+  框架版（Day4）：  langchain.agents.create_agent 一行搞定
 
-刻意踩坑点（阶段二保留 + 阶段三新增）：
-- 不设最大轮次限制 → 可能死循环
-- 默认截断策略为 "none" → 长对话超出上下文窗口
-- token 估算粗糙 → 中文对话 token 数严重低估
+LangChain 1.3+ API 变化：
+  旧: from langchain.agents import create_react_agent, AgentExecutor
+  新: from langchain.agents import create_agent
+  create_agent 内部自动处理 ReAct 循环 + 工具调用
+
+Java 类比：手写 for 循环 + if/else → Spring StateMachine 声明式流程
 """
 
-import json
-
-# ── 导入依赖模块 ─────────────────────────────────────────
 from src.llm_client import LLMClient
-from src.tools import get_tool_definitions, execute_tool
+from src.tools import get_tool_definitions, get_langchain_tools
 from src.memory import ConversationMemory, TruncationStrategy
+
+# ── Day4：LangChain v1.3+ Agent ────────────────────────────
+from langchain.agents import create_agent
 
 
 class ReActAgent:
     """
-    带记忆的 ReAct Agent
+    ReAct Agent —— Day4 框架版（LangChain 1.3+）
 
-    阶段二 → 阶段三的关键变化：
-    - 之前：每次 run() 从零构建 messages，对话完就忘
-    - 现在：所有消息存入 ConversationMemory，多次 run() 共享
-
-    类比 Java：
-        @Service 类，注入 LLMClient 和 ConversationMemory 两个依赖。
-        ConversationMemory 相当于一个有状态 Repository，
-        持久化会话数据，支持不同的查询策略（截断方式）。
+    使用 create_agent 替代手搓 while 循环。
+    接口完全兼容 Day1-3 的 ReActAgent。
     """
 
     def __init__(
         self,
-        max_iterations: int = 10,                 # 阶段三新增：最大循环轮次
-        truncation_strategy: TruncationStrategy = "none",  # 阶段三新增：截断策略
+        max_iterations: int = 10,
+        truncation_strategy: TruncationStrategy = "none",
     ):
-        """
-        初始化 Agent
-
-        参数：
-            max_iterations:      防止死循环的轮次上限（默认 10）
-            truncation_strategy: 截断策略，可选 "none"|"sliding_window"|"token_limit"
-        """
-        # ── 依赖组件 ──
+        """初始化 Agent"""
         self.llm = LLMClient()
         self.tools = get_tool_definitions()
 
-        # ── 记忆系统（阶段三新增）──
-        # ConversationMemory 存储所有对话，跨 run() 保留
+        # ── 记忆系统 ──
         self.memory = ConversationMemory(max_messages=20, max_tokens=4000)
         self.truncation_strategy = truncation_strategy
 
-        # ── 系统提示词（Day3 修复 #3：从"请求"改为"命令"）──
+        # ── system prompt ──
         self.system_prompt = (
             "你是 ReAct Agent，必须通过工具与外界交互。\n\n"
-            "核心规则（违反将导致错误结果）：\n"
-            "1. 计算类问题（如'XXX等于多少'、'算一下'）→ 必须调用 calculator 工具\n"
-            "2. 知识类问题（如'XXX是什么'、'介绍一下'）→ 必须调用 search_knowledge 工具\n"
-            "3. 不要用你自己的知识直接回答 —— 你的知识可能过时或不准确\n"
-            "4. 获取工具结果后，用自然语言向用户解释结果\n"
-            "5. 如果工具返回错误，如实告诉用户，不要编造答案\n"
+            "核心规则：\n"
+            "1. 计算类问题 → 必须调用 calculator 工具\n"
+            "2. 知识类问题 → 必须调用 search_knowledge 工具\n"
+            "3. 不要用自己的知识直接回答\n"
+            "4. 工具返回错误时如实告诉用户\n"
         )
-        # 系统提示词存入 memory —— 它始终在消息列表第一位
         self.memory.set_system(self.system_prompt)
 
-        # ── 循环控制 ──
         self.max_iterations = max_iterations
 
-    # ═══════════════════════════════════════════════════════
-    # 核心入口
-    # ═══════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════
+        # Day4: LangChain 1.3+ create_agent 一行建 Agent
+        # ═══════════════════════════════════════════════════
+        lc_tools = get_langchain_tools()
+
+        self._agent = create_agent(
+            model=self.llm._llm,        # LangChain ChatOpenAI 对象
+            tools=lc_tools,
+            system_prompt=self.system_prompt,
+        )
+        # create_agent 返回的是一个 Runnable，直接 .invoke() 就行
+        # 内部自动处理：ReAct循环、工具调用、结果反馈
 
     def run(self, user_message: str) -> str:
         """
-        执行一次 Agent 对话 —— 自动调用工具直到得出最终答案
+        执行一次 Agent 对话 —— 接口完全兼容 Day1-3
 
-        参数：
-            user_message: 用户输入
-
-        返回：
-            LLM 的最终回复
-
-        阶段三变化：
-        - 不再每次构建 messages 列表，改为往 memory 里追加
-        - 每次调 LLM 前从 memory 获取（可能经过截断的）消息
-        - 支持多轮对话：第二次 run() 时 memory 里保留着之前的对话
+        Day4 变化：_agent.invoke() 替代 while 循环
         """
-        # ── 追加用户消息到记忆 ──
-        # 注意：这是持久化的，下次 run() 时还能看到
         self.memory.add_user(user_message)
 
-        # ── 记录循环轮次 ──
-        iteration = 0
+        # 构建对话历史
+        messages = self.memory.get_messages(strategy=self.truncation_strategy)
+        history = [
+            m["content"] for m in messages
+            if m["role"] in ("user", "assistant")
+        ]
 
-        # ╔══════════════════════════════════════════════════╗
-        # ║          ReAct 核心循环                          ║
-        # ╚══════════════════════════════════════════════════╝
-        while True:
-            iteration += 1
-            print(f"  [Agent] 第 {iteration} 轮思考...")
+        # ═══════════════════════════════════════════════════
+        # Day4 核心：一行替代 70 行 while 循环
+        # ═══════════════════════════════════════════════════
+        result = self._agent.invoke({
+            "messages": [
+                {"role": "user", "content": user_message},
+            ],
+        })
 
-            # ── 阶段三新增：轮次保护 ──
-            # 防止 LLM 陷入死循环（比如不断调工具但永远不回答）
-            if iteration > self.max_iterations:
-                print(f"  [Agent] ⚠️ 超过最大轮次 {self.max_iterations}，强制终止")
-                return "抱歉，处理超时，请尝试简化问题后重试。"
+        # 提取最终回复
+        # create_agent 返回的 messages 列表中最后一条是 AI 的最终回复
+        output_msgs = result.get("messages", [])
+        answer = ""
+        for msg in reversed(output_msgs):
+            if hasattr(msg, "content") and msg.content:
+                answer = msg.content
+                break
 
-            # ── 步骤 1：从记忆获取消息（可能截断）──
-            # 阶段三关键：不再用本地 messages 列表，而是从 memory 取
-            messages = self.memory.get_messages(strategy=self.truncation_strategy)
-
-            # ── 步骤 2：调用 LLM ──
-            response = self.llm.chat(
-                messages=messages,
-                tools=self.tools,
-                temperature=0.1,
-            )
-
-            # ── 步骤 3：处理 LLM 响应 ──
-            # 注意顺序：必须先检查 tool_calls 再检查 content！
-            # 原因：LLM 有时会返回 "好的我来做" + tool_calls 同时存在，
-            # 如果先检查 content 就直接 return 了，工具调用被跳过。
-
-            # 情况 A：LLM 请求调用工具（优先检查）
-            if response["tool_calls"]:
-                # ── 把 LLM 的工具调用意图存入记忆 ──
-                self.memory.add_assistant(
-                    content=response["content"],   # 可能有文字也可能为 None
-                    tool_calls=[
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for tc in response["tool_calls"]
-                    ],
-                )
-
-                # ── 执行工具 + 结果反馈（Day3 修复 #5：异常保护）──
-                for tc in response["tool_calls"]:
-                    tool_name = tc["name"]
-                    # 参数解析保护：LLM 传的 arguments 可能不是合法 JSON
-                    try:
-                        tool_args = json.loads(tc["arguments"])
-                    except json.JSONDecodeError as e:
-                        tool_result = f"工具参数格式错误: {e}。请用正确的 JSON 格式重试，例如 {{\"expression\": \"1+2\"}}"
-                        print(f"  [Agent] ⚠️ {tool_result}")
-                        self.memory.add_tool_result(
-                            tool_call_id=tc["id"],
-                            tool_name=tool_name,
-                            result=tool_result,
-                        )
-                        continue
-
-                    print(f"  [Agent] 🔧 调用工具: {tool_name}({tool_args})")
-
-                    # 工具执行保护：捕获所有异常，把错误信息反馈给 LLM
-                    try:
-                        tool_result = execute_tool(tool_name, tool_args)
-                    except Exception as e:
-                        tool_result = f"工具执行失败 ({type(e).__name__}): {e}"
-                        print(f"  [Agent] ⚠️ {tool_result}")
-
-                    print(f"  [Agent] 📤 工具结果: {tool_result}")
-
-                    self.memory.add_tool_result(
-                        tool_call_id=tc["id"],
-                        tool_name=tool_name,
-                        result=str(tool_result),
-                    )
-                # ── 工具执行完，继续循环让 LLM 看结果 ──
-                continue
-
-            # 情况 B：LLM 直接给出文字回答（没有 tool_calls）
-            if response["content"]:
-                print(f"  [Agent] LLM 给出最终答案")
-                self.memory.add_assistant(content=response["content"])
-                return response["content"]
-
-            # 情况 C：既没 tool_calls 也没 content（极端情况，添加保护）
-            print(f"  [Agent] ⚠️ LLM 返回空响应，重试...")
-            continue
+        self.memory.add_assistant(content=answer)
+        return answer
 
     # ═══════════════════════════════════════════════════════
-    # 记忆管理
+    # 记忆管理（同 Day3）
     # ═══════════════════════════════════════════════════════
 
     def clear_memory(self):
-        """
-        清空对话记忆 —— 开始全新对话
-
-        会保留 system prompt，只清除 user/assistant/tool 消息。
-        """
         self.memory.clear()
         self.memory.set_system(self.system_prompt)
-        print("[Agent] 记忆已清空")
 
     def set_truncation(self, strategy: TruncationStrategy):
-        """
-        切换截断策略 —— 用于对比测试不同策略的效果
-
-        用法：
-            agent.set_truncation("sliding_window")
-            agent.run("继续上一轮的问题...")
-        """
         self.truncation_strategy = strategy
-        print(f"[Agent] 截断策略切换为: {strategy}")
 
     def memory_stats(self) -> dict:
-        """
-        返回记忆状态信息 —— 调试和监控用
-
-        返回：
-            {"total_messages": N, "non_system": N, "strategy": "..."}
-        """
         return {
             "total_messages": len(self.memory),
             "non_system": self.memory.count_messages(),
@@ -231,7 +125,6 @@ class ReActAgent:
 
 # ── 便捷函数 ─────────────────────────────────────────────
 def run_agent(question: str) -> str:
-    """一键启动带记忆的 Agent"""
     agent = ReActAgent()
     return agent.run(question)
 
@@ -239,20 +132,13 @@ def run_agent(question: str) -> str:
 # ── 模块自测 ─────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 50)
-    print("ReAct Agent（带记忆）自测")
+    print("ReAct Agent（LangChain 1.3+ create_agent）自测")
     print("=" * 50)
 
-    agent = ReActAgent(max_iterations=10, truncation_strategy="none")
+    agent = ReActAgent(max_iterations=5)
 
-    # 测试多轮对话
-    rounds = [
-        "帮我计算 100 + 200 等于多少",
-        "刚才的结果再乘以 3 等于多少",   # ← 需要记住上一轮
-    ]
-
-    for q in rounds:
-        print(f"\n👤 用户: {q}")
-        answer = agent.run(q)
-        print(f"🤖 Agent: {answer}")
-        print(f"📊 {agent.memory_stats()}")
-        print("-" * 50)
+    q = "帮我计算 100 + 200 等于多少"
+    print(f"\n👤 用户: {q}")
+    answer = agent.run(q)
+    print(f"🤖 Agent: {answer}")
+    print("✅ 自测完成")

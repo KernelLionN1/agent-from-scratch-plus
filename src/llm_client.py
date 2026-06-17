@@ -1,68 +1,60 @@
 """
-LLM 客户端封装 —— 对接 DeepSeek API（OpenAI 兼容协议）
+LLM 客户端封装 —— Day4 框架版：基于 LangChain ChatDeepSeek
 
-核心职责：把「调用 LLM」这件事封装成一个类，外部只需要传 messages 和 tools，
-不需要关心 API Key 从哪来、HTTP 请求怎么发、返回值怎么解析。
+Day4 核心变化：
+  手搓版（Day1-3）：openai.OpenAI 裸调 + 手动重试 + 自定义 dict 返回
+  框架版（Day4）：  ChatOpenAI(DeepSeek) + LangChain 内置重试 + AIMessage 原生对象
 
-刻意踩坑点：
-- 不做请求重试（让调用方自己处理错误）
-- 不做超时控制（后面阶段再加）
+关键收益：
+  - 不再需要手动写指数退避重试 → LangChain 内置 tenacity
+  - 不再需要 asyncio.to_thread → LangChain 原生 async（ainvoke）
+  - 不再需要 _parse_chat_response → LangChain 返回结构化 AIMessage
+
+Java 类比：从手写 HttpClient + JSON 解析 → 用 Spring RestTemplate
 """
 
-# ── 导入依赖 ──────────────────────────────────────────────
 import os
-import time  # Day3 修复 #10：指数退避重试用
-from dotenv import load_dotenv  # 从 .env 文件读取环境变量
-from openai import OpenAI        # OpenAI SDK，兼容 DeepSeek
-# Day3 修复 #10：按可重试/不可重试分类 OpenAI 异常
-from openai import (
-    APITimeoutError,       # 网络超时 — 可重试
-    RateLimitError,        # 429 限流 — 可重试
-    APIConnectionError,    # 连接失败 — 可重试
-    InternalServerError,   # 5xx — 可重试
-    AuthenticationError,   # 401 — 不可重试
-    BadRequestError,       # 400 — 不可重试
-)
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI  # DeepSeek 兼容 OpenAI 协议
 
-# 模块加载时自动读取 .env 文件，之后 os.getenv() 就能拿到配置
 load_dotenv()
 
+# ── LangChain LLM 客户端 ──────────────────────────────────
 
-# ── LLM 客户端类 ──────────────────────────────────────────
 class LLMClient:
     """
-    封装 DeepSeek API 调用（Day3 修复 #10：加重试机制）
+    LLM 调用封装 —— Day4 框架版
 
-    Day3 修复 #10：从裸调升级为指数退避重试
-      可重试错误（网络抖动）：超时/429限流/连接失败/5xx → 最多 3 次重试
-      不可重试错误（参数/认证）：401/400 → 直接抛，不浪费重试
-      退避间隔：1s → 2s → 4s（指数增长，防止惊群效应）
+    底层：langchain_openai.ChatOpenAI（指向 DeepSeek API）
+    优势：原生 async（ainvoke）、内置重试、token 用量自动追踪
 
     使用方式：
         client = LLMClient()
-        response = client.chat(messages=[...], tools=[...])
+        response = client.chat([{"role": "user", "content": "你好"}])
+        # response 仍然返回 dict，保持调用方兼容
     """
 
     def __init__(self):
-        """
-        初始化客户端 —— 从环境变量读取配置并创建 OpenAI 连接
-
-        对应 Java 里读取 application.yml 后构建 HttpClient，
-        区别是 Python 用 os.getenv() 直读环境变量。
-        """
-        # 从 .env 读 API Key —— 绝不能硬编码在代码里
+        """初始化 ChatOpenAI 客户端，指向 DeepSeek"""
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
-        # DeepSeek 的 API 地址 —— 和 OpenAI 不冲突，base_url 指向别处
         self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        # 模型名，默认 deepseek-chat
         self.model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-        # 没有 Key 直接报错 —— 早失败比晚失败好调试
         if not self.api_key:
-            raise ValueError("DEEPSEEK_API_KEY 未设置，请检查 .env 文件")
+            raise ValueError("DEEPSEEK_API_KEY 未设置")
 
-        # 创建 OpenAI 客户端实例 —— 底层封装了 HTTP 连接池
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        # ═══════════════════════════════════════════════════
+        # Day4 核心：LangChain 的 ChatOpenAI 封装
+        # 内置重试（max_retries）+ 原生 async（ainvoke）
+        # ═══════════════════════════════════════════════════
+        self._llm = ChatOpenAI(
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            temperature=0.7,
+            max_tokens=1024,
+            max_retries=3,        # Day4：LangChain 内置重试，不再手写指数退避
+        )
 
     def chat(
         self,
@@ -70,129 +62,177 @@ class LLMClient:
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
-        max_retries: int = 3,  # Day3 修复 #10：最大重试次数
     ) -> dict:
         """
-        调用 LLM（Day3 修复 #10：失败时指数退避重试）
+        同步调用 LLM（兼容手搓版接口）
 
-        参数：
-            messages:   对话历史
-            tools:      可选工具定义
-            temperature: 0~2
-            max_tokens:  最大输出长度
-            max_retries: 最大重试次数（默认 3）
-
-        返回：统一 dict {content, tool_calls, model, usage}
-
-        重试策略（Day3 修复 #10）：
-            - 可重试：APITimeoutError / RateLimitError / APIConnectionError / InternalServerError
-            - 不可重试：AuthenticationError / BadRequestError → 直接抛
-            - 退避间隔：2^0=1s → 2^1=2s → 2^2=4s
-            - 3 次全部失败后抛 RuntimeError
+        参数与返回格式同 Day1-3，保证调用方（agent.py/api.py）不改动。
         """
-        # ── 构建请求参数（不变）──
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        # 更新参数
+        self._llm.temperature = temperature
+        self._llm.max_tokens = max_tokens
+
+        # Day4：LangChain 原生工具绑定
         if tools:
-            kwargs["tools"] = tools
+            llm_with_tools = self._llm.bind_tools(
+                [_convert_tool_lc(t) for t in tools]
+            )
+        else:
+            llm_with_tools = self._llm
 
-        # ═══════════════════════════════════════════════════
-        # Day3 修复 #10：指数退避重试循环
-        # ═══════════════════════════════════════════════════
-        last_error = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                # ── 发出 HTTP 请求 ──
-                response = self.client.chat.completions.create(**kwargs)
+        # 同步调用 → 内部阻塞等待
+        response = llm_with_tools.invoke([_to_lc_message(m) for m in messages])
+        return _to_dict(response)
 
-                # 成功 → 解析返回
-                return _parse_chat_response(response)
+    async def ainvoke(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ) -> dict:
+        """
+        Day4 新增：原生异步调用 —— 不需要 asyncio.to_thread！
 
-            except (AuthenticationError, BadRequestError) as e:
-                # 不可重试：API Key 错了、参数格式不对 → 重试没用
-                raise RuntimeError(
-                    f"LLM 调用失败（不可重试）: {type(e).__name__}: {e}"
-                )
+        这是框架版最大的性能提升：LangChain 的 ainvoke 是真正的 async，
+        不占线程池，可以直接 await。
+        """
+        self._llm.temperature = temperature
+        self._llm.max_tokens = max_tokens
 
-            except (APITimeoutError, RateLimitError, APIConnectionError,
-                    InternalServerError) as e:
-                # 可重试：网络抖动 / 限流 / 服务端临时故障
-                last_error = e
-                if attempt < max_retries:
-                    wait = 2 ** (attempt - 1)  # 指数退避: 1s → 2s → 4s
-                    print(f"  [LLM] {type(e).__name__}，{wait}s 后重试 ({attempt}/{max_retries})...")
-                    time.sleep(wait)
-                else:
-                    print(f"  [LLM] 已重试 {max_retries} 次，全部失败")
+        if tools:
+            llm_with_tools = self._llm.bind_tools(
+                [_convert_tool_lc(t) for t in tools]
+            )
+        else:
+            llm_with_tools = self._llm
 
-        # 所有重试耗尽
-        raise RuntimeError(
-            f"LLM 调用失败（已重试 {max_retries} 次）: "
-            f"{type(last_error).__name__}: {last_error}"
+        response = await llm_with_tools.ainvoke(
+            [_to_lc_message(m) for m in messages]
         )
+        return _to_dict(response)
 
 
-# ── 工具函数：解析 LLM 响应 ─────────────────────────────
-def _parse_chat_response(response) -> dict:
+# ── 格式转换工具函数（手搓 dict ↔ LangChain 对象）────────
+
+def _to_lc_message(msg: dict):
+    """手搓版 dict → LangChain 消息对象"""
+    from langchain_core.messages import (
+        HumanMessage, AIMessage, SystemMessage, ToolMessage,
+    )
+    role = msg["role"]
+    content = msg.get("content", "") or ""
+    if role == "system":
+        return SystemMessage(content=content)
+    elif role == "user":
+        return HumanMessage(content=content)
+    elif role == "assistant":
+        msg_obj = AIMessage(content=content)
+        if msg.get("tool_calls"):
+            msg_obj.tool_calls = [
+                {
+                    "id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "args": _safe_json_parse(tc["function"]["arguments"]),
+                }
+                for tc in msg["tool_calls"]
+            ]
+        return msg_obj
+    elif role == "tool":
+        return ToolMessage(
+            content=content,
+            tool_call_id=msg["tool_call_id"],
+        )
+    return HumanMessage(content=str(content))
+
+
+def _to_dict(response) -> dict:
     """
-    Day3 修复 #10：从 chat() 内联提取为独立函数
+    LangChain AIMessage → 手搓版统一 dict
 
-    把 OpenAI SDK 的 response 对象转成统一的 dict 格式，
-    外部调用方不需要 import openai。
+    保持返回格式与 Day1-3 完全一致：
+    {content, tool_calls, model, usage}
     """
-    choice = response.choices[0]
-    msg = choice.message
+    tool_calls = None
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        tool_calls = [
+            {
+                "id": tc.get("id", ""),
+                "name": tc.get("name", ""),
+                "arguments": _safe_json_dumps(tc.get("args", {})),  
+            }
+            for tc in response.tool_calls
+        ]
+
+    # LangChain 的 usage_metadata 包含 token 信息
+    usage = {}
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        um = response.usage_metadata
+        usage = {
+            "prompt_tokens": um.get("input_tokens", 0),
+            "completion_tokens": um.get("output_tokens", 0),
+            "total_tokens": um.get("total_tokens", 0),
+        }
 
     return {
-        # msg.content 可能是 None（当 LLM 决定调工具时）
-        "content": msg.content,
-        # 从 message 对象里提取 tool_calls
-        "tool_calls": _parse_tool_calls(msg),
-        # 记录实际使用的模型
-        "model": response.model,
-        # token 用量
-        "usage": {
-            "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-            "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-            "total_tokens": response.usage.total_tokens if response.usage else 0,
-        },
+        "content": response.content,
+        "tool_calls": tool_calls,
+        "model": getattr(response, "response_metadata", {}).get("model_name", ""),
+        "usage": usage,
     }
 
 
-def _parse_tool_calls(message) -> list[dict] | None:
+def _convert_tool_lc(tool_def: dict):
     """
-    从 OpenAI 的 message 对象中提取 tool_calls
+    手搓版 OpenAI 格式工具定义 → LangChain tool 对象
 
-    OpenAI SDK 原格式：
-        message.tool_calls = [
-            ToolCall(
-                id="call_xxx",
-                function=FunctionCall(
-                    name="calculator",
-                    arguments='{"expression": "1+1"}'  # 注意：这是 JSON 字符串，不是 dict
-                )
-            )
-        ]
-
-    我们转成纯 dict 列表：
-        [{"id": "call_xxx", "name": "calculator", "arguments": '{"expression": "1+1"}'}]
-
-    为什么不在这一层就 json.loads(arguments)？
-    —— 留给调用方决定怎么解析，保持数据原样传递。
+    手搓版格式：
+      {type: "function", function: {name: "...", description: "...", parameters: {...}}}
     """
-    # LLM 没想调工具，直接返回 None
-    if not message.tool_calls:
-        return None
+    from langchain_core.tools import StructuredTool
 
-    result = []
-    for tc in message.tool_calls:
-        result.append({
-            "id": tc.id,                          # 工具调用的唯一 ID，后续关联结果用
-            "name": tc.function.name,             # 工具名，如 "calculator"
-            "arguments": tc.function.arguments,   # JSON 字符串，需要调用方自己 json.loads()
-        })
-    return result
+    name = tool_def["function"]["name"]
+    desc = tool_def["function"]["description"]
+    # 提取参数 schema
+    params = tool_def["function"]["parameters"]["properties"]
+    # 构建一个占位 tool（实际执行仍走手搓注册表）
+    return StructuredTool.from_function(
+        func=lambda **kwargs: f"[tool:{name}] called with {kwargs}",
+        name=name,
+        description=desc,
+    )
+
+
+def _safe_json_parse(s: str) -> dict:
+    """安全解析 JSON 字符串"""
+    import json
+    try:
+        return json.loads(s) if isinstance(s, str) else s
+    except json.JSONDecodeError:
+        return {}
+
+
+def _safe_json_dumps(obj: dict) -> str:
+    """安全序列化为 JSON 字符串"""
+    import json
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+# ── 模块自测 ──────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 50)
+    print("LLMClient (LangChain版) 自测")
+    print("=" * 50)
+
+    client = LLMClient()
+
+    # 同步调用
+    result = client.chat(
+        messages=[{"role": "user", "content": "说你好"}],
+    )
+    print(f"同步: {result['content'][:50]}...")
+    print(f"tokens: {result['usage']}")
+    print("✅ 自测完成")
