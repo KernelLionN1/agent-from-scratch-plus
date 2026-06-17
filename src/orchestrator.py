@@ -19,6 +19,10 @@
 from src.message_bus import MessageBus, Message
 from src.agents import PlannerAgent, CoderAgent, ReviewerAgent
 
+# 阶段三新增：异步并行支持
+import asyncio
+import re
+
 
 class Orchestrator:
     """
@@ -182,6 +186,273 @@ class Orchestrator:
             "code": code_msgs[-1].content if code_msgs else "",
             "review": reviews[-1].content if reviews else "",
             "fixed_code": fixed_code,
+        }
+
+    # ═══════════════════════════════════════════════════════
+    # 阶段三：并行执行
+    # ═══════════════════════════════════════════════════════
+
+    def _parse_subtasks(self, plan_text: str) -> list[str]:
+        """
+        从 Planner 输出中粗略提取子任务
+
+        参数：
+            plan_text: Planner 的输出文本
+
+        返回：
+            子任务描述列表
+
+        【踩坑】这里用最简单的正则匹配，没有做严格的格式解析。
+        Planner 输出的格式稍有变化就会解析失败。
+        """
+        subtasks = []
+
+        # 尝试匹配「### 子任务 N：标题」或「**子任务 N**」格式
+        # 用正则按标题分割
+        parts = re.split(r'(?:###?\s*子任务\s*\d+|【子任务\d】)', plan_text)
+
+        if len(parts) <= 1:
+            # 如果正则没匹配到，尝试按双换行分割作为兜底
+            parts = plan_text.split("\n\n")
+
+        for part in parts:
+            part = part.strip()
+            # 跳过太短的内容（可能是标题残留）
+            if len(part) > 30:
+                subtasks.append(part)
+
+        # 如果没拆出来子任务，就把整个 plan 作为一个任务
+        if not subtasks:
+            subtasks = [plan_text]
+
+        print(f"   📦 拆分出 {len(subtasks)} 个子任务")
+        return subtasks
+
+    async def _coder_async(self, coder: CoderAgent, subtask: str, task_id: int) -> dict:
+        """
+        异步执行单个 Coder 任务
+
+        参数：
+            coder:   Coder Agent 实例
+            subtask: 子任务描述
+            task_id: 任务编号（用于追踪）
+
+        返回：
+            {"task_id": int, "subtask": str, "code": str}
+
+        【踩坑】LLM 调用本身是同步的，用 asyncio.to_thread() 包装。
+        真正的异步 LLM 调用应该用 aiohttp/httpx 的异步客户端。
+        """
+        print(f"   🧵 任务 {task_id} 开始...")
+        # to_thread: 把同步调用丢到线程池，不阻塞事件循环
+        # 相当于 Java 的 CompletableFuture.supplyAsync()
+        code = await asyncio.to_thread(coder.execute, subtask)
+        print(f"   ✅ 任务 {task_id} 完成 ({len(code)} 字符)")
+        return {
+            "task_id": task_id,
+            "subtask": subtask,
+            "code": code,
+        }
+
+    def run_parallel(self, requirement: str, n_coders: int = 2, timeout: float = 120) -> dict:
+        """
+        并行执行：Planner 拆分 → 多个 Coder 并行处理 → 汇总结果
+
+        流程：
+            用户需求
+               ↓
+            Planner → 拆分成 N 个子任务
+               ↓
+            ┌──────┼──────┐
+            ↓      ↓      ↓
+          Coder1 Coder2 Coder3  ← 并行执行
+            ↓      ↓      ↓
+            └──────┼──────┘
+               ↓
+            Reviewer → 审核汇总后的代码
+               ↓
+            最终结果
+
+        参数：
+            requirement: 用户的原始需求
+            n_coders:    并行工作的 Coder 数量
+            timeout:     整体超时秒数
+
+        返回：
+            {
+                "plan":     规划结果,
+                "codes":    [{task_id, subtask, code}, ...],
+                "combined": 合并后的代码,
+                "review":   审核意见,
+                "timing":   {plan, coders, review} 耗时统计,
+            }
+        """
+        import time
+
+        print("\n" + "=" * 60)
+        print(f"🚀 开始并行编排：{requirement[:50]}...")
+        print("=" * 60)
+
+        timing = {}
+
+        # ── 步骤 1：Planner 拆分（串行，只有一次 LLM 调用）──
+        print("\n📋 步骤 1/3：Planner 拆分需求...")
+        t0 = time.time()
+        plan = self.planner.execute(requirement)
+        timing["plan"] = time.time() - t0
+        print(f"   Planner 输出: {len(plan)} 字符 ({timing['plan']:.1f}s)")
+
+        # ── 提取子任务 ──
+        subtasks = self._parse_subtasks(plan)
+        if len(subtasks) > n_coders:
+            subtasks = subtasks[:n_coders]  # 只取前 N 个
+
+        # ── 步骤 2：多个 Coder 并行执行 ──
+        print(f"\n💻 步骤 2/3：{len(subtasks)} 个 Coder 并行生成代码...")
+        t0 = time.time()
+
+        # 为每个子任务创建一个独立的 Coder 实例
+        # 避免共享同一个 LLMClient 导致的串行化问题
+        coders = [CoderAgent(self.bus, f"coder-{i+1}") for i in range(len(subtasks))]
+
+        # asyncio.gather：同时启动所有协程，等全部完成
+        # 相当于 Java 的 CompletableFuture.allOf()
+        async def _run_all():
+            tasks = [
+                self._coder_async(coders[i], subtasks[i], i + 1)
+                for i in range(len(subtasks))
+            ]
+            return await asyncio.gather(*tasks)
+
+        # 启动事件循环并等待全部完成
+        codes = asyncio.run(_run_all())
+        timing["coders"] = time.time() - t0
+        print(f"   ⏱️ 并行耗时: {timing['coders']:.1f}s（串行预估: {timing['coders'] * len(subtasks):.0f}s）")
+
+        # ── 汇总 ──
+        print(f"\n📦 汇总 {len(codes)} 份代码...")
+        combined = "\n\n".join([
+            f"# === 子任务 {c['task_id']} ===\n{c['code']}"
+            for c in codes
+        ])
+        print(f"   合并后: {len(combined)} 字符")
+
+        # ── 步骤 3：Reviewer 审核汇总结果 ──
+        print(f"\n🔍 步骤 3/3：Reviewer 审核汇总代码...")
+        t0 = time.time()
+        review = self.reviewer.execute(combined)
+        timing["review"] = time.time() - t0
+        print(f"   Reviewer 输出: {len(review)} 字符 ({timing['review']:.1f}s)")
+
+        print("\n" + "=" * 60)
+        print("✅ 并行编排完成")
+        print(f"   总耗时: {sum(timing.values()):.1f}s")
+        print("=" * 60)
+
+        return {
+            "plan": plan,
+            "codes": codes,
+            "combined": combined,
+            "review": review,
+            "timing": timing,
+        }
+
+    def run_parallel_no_await(self, requirement: str) -> dict:
+        """
+        【踩坑演示】并行时不写 await，主线程直接退出
+
+        这个方法故意不 await，展示不等待的后果：
+        - 协程被创建但没有被等待
+        - 主函数返回时协程还没执行完
+        - 返回的结果是空的
+
+        用法：和 run_parallel() 对比输出，观察差异。
+        """
+        import time
+
+        print("\n" + "=" * 60)
+        print(f"🚀 【踩坑】并行编排（不等待）：{requirement[:50]}...")
+        print("=" * 60)
+
+        # Planner 拆分
+        plan = self.planner.execute(requirement)
+        subtasks = self._parse_subtasks(plan)[:2]
+
+        # ⚠️ 【踩坑】创建协程但不 await
+        # 协程对象被创建后立即被丢弃，永远不会执行
+        print(f"\n💻 创建 {len(subtasks)} 个 Coder 协程但不等待...")
+
+        coders = [CoderAgent(self.bus, f"coder-{i+1}") for i in range(len(subtasks))]
+        discarded = []  # 协程对象被丢弃在这里
+        for i in range(len(subtasks)):
+            coro = self._coder_async(coders[i], subtasks[i], i + 1)
+            discarded.append(coro)  # 创建了但没有 await！
+            print(f"   ⚠️ 任务 {i+1} 协程已创建但未被等待（已丢弃）")
+
+        print(f"\n   💀 主线程直接返回，{len(discarded)} 个协程永远没执行")
+        print(f"   ⚠️ 【踩坑确认】不写 await，任务全部丢失")
+
+        return {
+            "plan": plan,
+            "codes": [],  # 空的！没等到任何结果
+            "combined": "",
+            "review": "",
+            "warning": "所有 Coder 协程被丢弃，未执行",
+        }
+
+    def run_parallel_with_timeout(self, requirement: str, timeout: float = 5) -> dict:
+        """
+        并行执行 + 超时控制
+
+        参数：
+            timeout: 单个任务超时秒数（默认 5s，故意设小以触发超时）
+
+        返回：
+            和 run_parallel 相同，但超时的任务返回错误信息而非代码
+
+        【踩坑】超时处理简单粗暴：asyncio.wait_for 抛出 TimeoutError，
+        不做部分结果收集，丢失已完成任务的结果。
+        """
+        import time
+
+        print("\n" + "=" * 60)
+        print(f"🚀 并行编排（超时={timeout}s）：{requirement[:50]}...")
+        print("=" * 60)
+
+        plan = self.planner.execute(requirement)
+        subtasks = self._parse_subtasks(plan)[:2]
+        coders = [CoderAgent(self.bus, f"coder-{i+1}") for i in range(len(subtasks))]
+
+        async def _run_with_timeout():
+            tasks = [
+                self._coder_async(coders[i], subtasks[i], i + 1)
+                for i in range(len(subtasks))
+            ]
+            try:
+                # 【踩坑】wait_for 超时后直接抛异常，已完成的结果也丢了
+                return await asyncio.wait_for(
+                    asyncio.gather(*tasks),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                print(f"   ⏰ 超时！({timeout}s)")
+                # 【踩坑】不收集已完成的部分结果，全部丢弃
+                return []
+
+        t0 = time.time()
+        codes = asyncio.run(_run_with_timeout())
+        elapsed = time.time() - t0
+
+        if not codes:
+            print(f"   💀 所有任务因超时丢失 ({elapsed:.1f}s)")
+
+        return {
+            "plan": plan,
+            "codes": codes,
+            "combined": "",
+            "review": "",
+            "timing": {"total": elapsed},
+            "timeout": timeout,
         }
 
     # ═══════════════════════════════════════════════════════
