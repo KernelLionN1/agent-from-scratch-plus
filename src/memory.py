@@ -56,6 +56,9 @@ class ConversationMemory:
         self.max_messages = max_messages
         self.max_tokens = max_tokens
 
+        # ── Day5: 上下文窗口大小（用于自动压缩阈值判断）──
+        self.context_window: int = 65536  # DeepSeek 默认 64K tokens
+
         # ── 内部状态 ──
         self._system_content: str = ""  # 系统提示词单独保存
 
@@ -165,6 +168,215 @@ class ConversationMemory:
             # 回退：字符数估算
             total = sum(len(m.get("content", "") or "") for m in messages)
             return total // 2
+
+    # ═══════════════════════════════════════════════════════
+    # Day5: 上下文压缩 —— 两级策略
+    # ═══════════════════════════════════════════════════════
+
+    def _usage_ratio(self, messages: list[dict] = None) -> float:
+        """
+        计算当前对话占上下文窗口的比例
+
+        Returns:
+            float: 0.0 ~ 1.0，0.1 = 用了10%
+        """
+        msgs = messages if messages is not None else self.get_messages("none")
+        return self._count_tokens(msgs) / self.context_window
+
+    def compress_light(self, messages: list[dict] = None) -> list[dict]:
+        """
+        轻量压缩：纯字符串操作，<100ms，不调 LLM
+
+        触发阈值：上下文窗口 10%（默认 6553 tokens）
+
+        策略：
+        1. 剔除失败的工具调用 → 只保留成功结果
+        2. 口语化改写 → "那个啥，帮我算一下" → "计算: 帮我算一下"
+        3. 合并连续同类消息 → 减少消息条数
+
+        Java 类比：StringBuilder 级别的优化，不涉及网络 IO
+        """
+        msgs = messages if messages is not None else self.get_messages("none")
+        if not msgs:
+            return msgs
+
+        before_count = len(msgs)
+        before_tokens = self._count_tokens(msgs)
+        import time
+        start = time.perf_counter()
+
+        # ── 步骤1: 剔除失败的工具调用 ──
+        # 失败特征：content 包含 "失败"、"Error"、"TypeError" 等
+        TOOL_FAILURE_KEYWORDS = [
+            "工具执行失败", "Error", "TypeError", "ValueError",
+            "KeyError", "AttributeError", "got an unexpected keyword"
+        ]
+        filtered = []
+        for msg in msgs:
+            if msg.get("role") == "tool":
+                content = str(msg.get("content", ""))
+                if any(kw in content for kw in TOOL_FAILURE_KEYWORDS):
+                    continue  # 跳过失败的工具结果
+            filtered.append(msg)
+
+        # ── 步骤2: 口语化改写 ──
+        # 只处理 user 角色，去掉口语冗余前缀
+        # "那个啥，帮我算一下 100+200" → "计算: 100+200"
+        # "嗯...我想问一下..." → ""
+        COLLOQUIAL_PATTERNS = [
+            ("那个啥，", ""),
+            ("嗯...", ""),
+            ("我想问一下", ""),
+            ("帮我", ""),
+            ("能不能", ""),
+            ("请问", ""),
+            ("麻烦你", ""),
+        ]
+        rewritten = []
+        for msg in filtered:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if content:
+                    for pattern, replacement in COLLOQUIAL_PATTERNS:
+                        if content.startswith(pattern):
+                            content = content[len(pattern):].strip()
+                            break
+                    # 如果去掉前缀后还有内容
+                    if content and content[-1] not in "？！。.?!，,：:":
+                        content += "。"
+                msg = {**msg, "content": content}
+            rewritten.append(msg)
+
+        # ── 步骤3: 合并连续同类消息 ──
+        # 连续 tool 结果合并为一条
+        merged = []
+        for msg in rewritten:
+            if (merged and msg.get("role") == "tool"
+                    and merged[-1].get("role") == "tool"):
+                # 合并到上一条 tool
+                merged[-1] = {
+                    **merged[-1],
+                    "content": merged[-1]["content"] + " | " + msg.get("content", ""),
+                }
+            else:
+                merged.append(msg)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        after_tokens = self._count_tokens(merged)
+        saved_tokens = before_tokens - after_tokens
+
+        print(f"  ⚡ 轻量压缩: {before_count}条→{len(merged)}条, "
+              f"{before_tokens}→{after_tokens}tokens (节省{saved_tokens}), "
+              f"{elapsed_ms:.1f}ms")
+
+        return merged
+
+    def compress_heavy(self, messages: list[dict] = None, llm=None) -> list[dict]:
+        """
+        重量压缩：调用 LLM 重写，>500ms，但压缩率极高
+
+        触发阈值：上下文窗口 70%（默认 ~35000 tokens）
+
+        策略：
+        1. 剔除失败的工具调用和最早轮次
+        2. 提取"目标 + 关键结果"，丢弃中间过程
+        3. 调用 LLM 进行总结重写 → 规范化输出
+
+        Args:
+            messages: 要压缩的消息列表（默认取全部）
+            llm: LLMClient 实例（必须提供）
+
+        Returns:
+            list[dict]: 压缩后的消息（system + 压缩内容作为单条 user-like 消息）
+
+        Java 类比：调用外部 NLP 服务做文本摘要
+        """
+        if llm is None:
+            raise ValueError("compress_heavy() 需要 LLMClient 实例")
+
+        msgs = messages if messages is not None else self.get_messages("none")
+        if not msgs:
+            return msgs
+
+        before_count = len(msgs)
+        before_tokens = self._count_tokens(msgs)
+
+        # ── 步骤1: 先做轻量清理 ──
+        msgs = self.compress_light(msgs)
+
+        # ── 步骤2: 提取目标和关键结果 ──
+        # 保留 system + 第一条 user（目标）+ 最后一条 assistant（结果）
+        system_msgs = [m for m in msgs if m.get("role") == "system"]
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
+        assistant_msgs = [m for m in msgs if m.get("role") == "assistant" and not m.get("tool_calls")]
+
+        # 构建压缩提示词
+        goals = "\n".join([m.get("content", "")[:200] for m in user_msgs[:5]])
+        results = "\n".join([m.get("content", "")[:300] for m in assistant_msgs[-3:]])
+
+        compress_prompt = (
+            "你是一个对话压缩器。请将以下多轮对话压缩为一段简洁的摘要，"
+            "只保留用户的核心目标和最终结果，去掉中间过程、闲聊和失败尝试。\n\n"
+            f"## 用户目标\n{goals}\n\n"
+            f"## 得出结果\n{results}\n\n"
+            "请用中文输出压缩后的摘要（200字以内）："
+        )
+
+        # ── 步骤3: 调 LLM 做压缩 ──
+        import time
+        start = time.perf_counter()
+
+        try:
+            compressed = llm.chat(
+                messages=[{"role": "user", "content": compress_prompt}],
+                temperature=0.3,
+                max_tokens=300,
+            )
+            summary = compressed.get("content", "").strip()
+        except Exception as e:
+            # LLM 调用失败 → 回退到轻量压缩结果
+            print(f"  ⚠️  重量压缩 LLM 调用失败: {e}，回退到轻量压缩")
+            return msgs
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        # ── 步骤4: 构建压缩后的消息 ──
+        result = list(system_msgs)  # 保留 system prompt
+        result.append({
+            "role": "user",
+            "content": f"[对话摘要] {summary}",
+        })
+
+        after_tokens = self._count_tokens(result)
+        saved_tokens = before_tokens - after_tokens
+
+        print(f"  🔥 重量压缩: {before_count}条→{len(result)}条, "
+              f"{before_tokens}→{after_tokens}tokens (节省{saved_tokens}), "
+              f"{elapsed_ms:.0f}ms")
+
+        return result
+
+    def auto_compress(self, llm=None) -> list[dict] | None:
+        """
+        根据当前使用率自动触发压缩
+
+        - < 10%: 不压缩
+        - 10%-70%: 轻量压缩
+        - > 70%: 重量压缩（需要 llm 参数）
+
+        返回压缩后的消息列表，如果不需要压缩返回 None。
+        调用方应把返回值替换进当前对话上下文。
+        """
+        messages = self.get_messages("none")
+        ratio = self._usage_ratio(messages)
+
+        if ratio < 0.1:
+            return None
+
+        if ratio < 0.7:
+            return self.compress_light(messages)
+
+        return self.compress_heavy(messages, llm=llm)
 
     # ═══════════════════════════════════════════════════════
     # 工具方法
