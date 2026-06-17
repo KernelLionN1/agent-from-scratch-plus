@@ -57,7 +57,7 @@ def test_7a_document_parsing():
 
 def test_7b_rag_ingest_and_query():
     """RAG 摄入 + 检索"""
-    from src.rag_engine import RAGEngine
+    from src.rag import RAGEngine
 
     tmpdir, files = create_test_docs()
     engine = RAGEngine(collection_name="test_rag")
@@ -81,7 +81,7 @@ def test_7b_rag_ingest_and_query():
 
 def test_7c_rag_answer_with_llm():
     """RAG 完整问答（需要 LLM）"""
-    from src.rag_engine import RAGEngine
+    from src.rag import RAGEngine
     from src.llm_client import LLMClient
 
     tmpdir, files = create_test_docs()
@@ -99,7 +99,7 @@ def test_7c_rag_answer_with_llm():
 
 def test_7d_vision_fallback():
     """图像理解回退（DeepSeek 不支持图片时用文件信息）"""
-    from src.vision import describe_image
+    from src.rag.vision import describe_image
     import base64
 
     # 1x1 PNG
